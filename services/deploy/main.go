@@ -2,11 +2,17 @@ package main
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
+	"os/exec"
+	"strings"
 	"sync"
 	"time"
 
@@ -17,14 +23,16 @@ import (
 // ─── Config ───────────────────────────────────────────────────
 
 type Config struct {
-	Port    string
-	NATSURL string
+	Port          string
+	NATSURL       string
+	WebhookSecret string
 }
 
 func loadConfig() Config {
 	return Config{
-		Port:    getEnv("PORT", "8082"),
-		NATSURL: getEnv("NATS_URL", "nats://localhost:4222"),
+		Port:          getEnv("PORT", "8082"),
+		NATSURL:       getEnv("NATS_URL", "nats://localhost:4222"),
+		WebhookSecret: getEnv("WEBHOOK_SECRET", ""),
 	}
 }
 
@@ -33,6 +41,82 @@ func getEnv(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+// ─── Service Registry ─────────────────────────────────────────
+// Maps git repo+branch → service configuration.
+
+type ServiceConfig struct {
+	ID          string `json:"id"`
+	ProjectID   string `json:"project_id"`
+	Name        string `json:"name"`
+	GitRepo     string `json:"git_repo"`
+	GitBranch   string `json:"git_branch"`
+	Port        int    `json:"port"`
+	Environment string `json:"environment"`
+	CreatedAt   time.Time `json:"created_at"`
+}
+
+type ServiceRegistry struct {
+	mu   sync.RWMutex
+	data map[string]*ServiceConfig
+}
+
+func NewServiceRegistry() *ServiceRegistry {
+	return &ServiceRegistry{data: make(map[string]*ServiceConfig)}
+}
+
+func (r *ServiceRegistry) Save(s *ServiceConfig) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.data[s.ID] = s
+}
+
+func (r *ServiceRegistry) Get(id string) (*ServiceConfig, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	s, ok := r.data[id]
+	return s, ok
+}
+
+func (r *ServiceRegistry) Delete(id string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	delete(r.data, id)
+}
+
+func (r *ServiceRegistry) List() []*ServiceConfig {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	out := make([]*ServiceConfig, 0, len(r.data))
+	for _, s := range r.data {
+		out = append(out, s)
+	}
+	return out
+}
+
+// FindByRepo finds a service matching the given clone URL and branch.
+// Also tries normalizing HTTPS/SSH URL variants.
+func (r *ServiceRegistry) FindByRepo(repoURL, branch string) (*ServiceConfig, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	normalized := normalizeRepoURL(repoURL)
+	for _, s := range r.data {
+		if normalizeRepoURL(s.GitRepo) == normalized && s.GitBranch == branch {
+			return s, true
+		}
+	}
+	return nil, false
+}
+
+// normalizeRepoURL strips .git suffix and normalizes github.com SSH/HTTPS variants.
+func normalizeRepoURL(u string) string {
+	u = strings.TrimSuffix(u, ".git")
+	// git@github.com:user/repo → github.com/user/repo
+	u = strings.Replace(u, "git@github.com:", "github.com/", 1)
+	u = strings.TrimPrefix(u, "https://")
+	u = strings.TrimPrefix(u, "http://")
+	return u
 }
 
 // ─── Domain ───────────────────────────────────────────────────
@@ -68,11 +152,12 @@ type DeployRequest struct {
 	ProjectID   string `json:"project_id"`
 	GitRepo     string `json:"git_repo"`
 	GitBranch   string `json:"git_branch"`
+	GitCommit   string `json:"git_commit"`
 	Environment string `json:"environment"`
 	TriggeredBy string `json:"triggered_by"`
 }
 
-// ─── Repository ───────────────────────────────────────────────
+// ─── Deployment Repository ────────────────────────────────────
 
 type DeploymentRepo struct {
 	mu   sync.RWMutex
@@ -143,6 +228,9 @@ func NewEventBus(url string) (*EventBus, error) {
 }
 
 func (b *EventBus) Publish(subject string, payload any) error {
+	if b.nc == nil {
+		return nil
+	}
 	data, err := json.Marshal(payload)
 	if err != nil {
 		return err
@@ -151,6 +239,9 @@ func (b *EventBus) Publish(subject string, payload any) error {
 }
 
 func (b *EventBus) Subscribe(subject string, handler func(data []byte)) error {
+	if b.nc == nil {
+		return nil
+	}
 	_, err := b.nc.Subscribe(subject, func(m *nats.Msg) {
 		handler(m.Data)
 	})
@@ -160,12 +251,13 @@ func (b *EventBus) Subscribe(subject string, handler func(data []byte)) error {
 // ─── Deploy Service ───────────────────────────────────────────
 
 type DeployService struct {
-	repo *DeploymentRepo
-	bus  *EventBus
+	repo        *DeploymentRepo
+	svcRegistry *ServiceRegistry
+	bus         *EventBus
 }
 
-func NewDeployService(repo *DeploymentRepo, bus *EventBus) *DeployService {
-	return &DeployService{repo: repo, bus: bus}
+func NewDeployService(repo *DeploymentRepo, svcRegistry *ServiceRegistry, bus *EventBus) *DeployService {
+	return &DeployService{repo: repo, svcRegistry: svcRegistry, bus: bus}
 }
 
 func (s *DeployService) TriggerDeploy(ctx context.Context, req DeployRequest) (*Deployment, error) {
@@ -175,6 +267,7 @@ func (s *DeployService) TriggerDeploy(ctx context.Context, req DeployRequest) (*
 		ProjectID:   req.ProjectID,
 		GitRepo:     req.GitRepo,
 		GitBranch:   req.GitBranch,
+		GitCommit:   req.GitCommit,
 		Environment: req.Environment,
 		Status:      StatusQueued,
 		TriggeredBy: req.TriggeredBy,
@@ -182,7 +275,6 @@ func (s *DeployService) TriggerDeploy(ctx context.Context, req DeployRequest) (*
 	}
 	s.repo.Save(d)
 
-	// Publish to build service via NATS
 	if err := s.bus.Publish("build.requested", map[string]string{
 		"deployment_id": d.ID,
 		"service_id":    d.ServiceID,
@@ -193,6 +285,7 @@ func (s *DeployService) TriggerDeploy(ctx context.Context, req DeployRequest) (*
 		log.Printf("warn: failed to publish build.requested: %v", err)
 	}
 
+	s.repo.UpdateStatus(d.ID, StatusBuilding, "build requested")
 	log.Printf("[deploy] triggered deployment %s for service %s", d.ID, d.ServiceID)
 	return d, nil
 }
@@ -203,7 +296,6 @@ func (s *DeployService) Rollback(ctx context.Context, deploymentID string) error
 		return fmt.Errorf("deployment not found")
 	}
 	s.repo.UpdateStatus(d.ID, StatusRolledBack, "manual rollback triggered")
-
 	s.bus.Publish("deploy.rollback", map[string]string{
 		"deployment_id": d.ID,
 		"service_id":    d.ServiceID,
@@ -211,8 +303,28 @@ func (s *DeployService) Rollback(ctx context.Context, deploymentID string) error
 	return nil
 }
 
+// runContainer stops any existing container for the service and starts a new one.
+func (s *DeployService) runContainer(ctx context.Context, imageTag, containerName string, port int) error {
+	// Stop and remove existing container — ignore errors (may not exist)
+	exec.CommandContext(ctx, "docker", "stop", containerName).Run()
+	exec.CommandContext(ctx, "docker", "rm", containerName).Run()
+
+	portFlag := fmt.Sprintf("%d:%d", port, port)
+	cmd := exec.CommandContext(ctx, "docker", "run", "-d",
+		"--name", containerName,
+		"-p", portFlag,
+		"--restart", "unless-stopped",
+		imageTag,
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("docker run: %w: %s", err, strings.TrimSpace(string(out)))
+	}
+	log.Printf("[deploy] container started: %s (image=%s port=%d)", containerName, imageTag, port)
+	return nil
+}
+
 func (s *DeployService) subscribeToEvents() {
-	// Listen for build results from build-service
 	s.bus.Subscribe("build.completed", func(data []byte) {
 		var payload map[string]string
 		if err := json.Unmarshal(data, &payload); err != nil {
@@ -220,13 +332,40 @@ func (s *DeployService) subscribeToEvents() {
 		}
 		deployID := payload["deployment_id"]
 		imageTag := payload["image_tag"]
-		s.repo.UpdateStatus(deployID, StatusDeploying, "build completed, starting deploy")
 
-		// Publish to runtime service
-		s.bus.Publish("runtime.deploy", map[string]string{
-			"deployment_id": deployID,
-			"image_tag":     imageTag,
-		})
+		d, ok := s.repo.Get(deployID)
+		if !ok {
+			log.Printf("[deploy] build.completed: deployment %s not found", deployID)
+			return
+		}
+		s.repo.UpdateStatus(deployID, StatusDeploying, "build complete, starting container")
+
+		port := 8080
+		if cfg, ok := s.svcRegistry.Get(d.ServiceID); ok {
+			port = cfg.Port
+		}
+
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+			defer cancel()
+
+			if err := s.runContainer(ctx, imageTag, d.ServiceID, port); err != nil {
+				log.Printf("[deploy] container run failed for %s: %v", deployID, err)
+				s.repo.UpdateStatus(deployID, StatusFailed, "container run failed: "+err.Error())
+				s.bus.Publish("deploy.failed", map[string]string{
+					"deployment_id": deployID,
+					"service_id":    d.ServiceID,
+					"error":         err.Error(),
+				})
+				return
+			}
+			s.repo.UpdateStatus(deployID, StatusSuccess,
+				fmt.Sprintf("container running on port %d", port))
+			s.bus.Publish("runtime.deployed", map[string]string{
+				"deployment_id": deployID,
+				"service_id":    d.ServiceID,
+			})
+		}()
 	})
 
 	s.bus.Subscribe("build.failed", func(data []byte) {
@@ -234,22 +373,44 @@ func (s *DeployService) subscribeToEvents() {
 		if err := json.Unmarshal(data, &payload); err != nil {
 			return
 		}
-		s.repo.UpdateStatus(payload["deployment_id"], StatusFailed, "build failed: "+payload["error"])
+		s.repo.UpdateStatus(payload["deployment_id"], StatusFailed,
+			"build failed: "+payload["error"])
 	})
+}
 
-	s.bus.Subscribe("runtime.deployed", func(data []byte) {
-		var payload map[string]string
-		if err := json.Unmarshal(data, &payload); err != nil {
-			return
-		}
-		s.repo.UpdateStatus(payload["deployment_id"], StatusSuccess, "deployment successful")
-	})
+// ─── GitHub Webhook ───────────────────────────────────────────
+
+type GitHubPushEvent struct {
+	Ref        string `json:"ref"` // "refs/heads/main"
+	Repository struct {
+		CloneURL string `json:"clone_url"`
+		SSHURL   string `json:"ssh_url"`
+	} `json:"repository"`
+	HeadCommit struct {
+		ID      string `json:"id"`
+		Message string `json:"message"`
+	} `json:"head_commit"`
+	Pusher struct {
+		Name  string `json:"name"`
+		Email string `json:"email"`
+	} `json:"pusher"`
+}
+
+func validateGitHubSignature(body []byte, signature, secret string) bool {
+	if !strings.HasPrefix(signature, "sha256=") {
+		return false
+	}
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write(body)
+	expected := "sha256=" + hex.EncodeToString(mac.Sum(nil))
+	return hmac.Equal([]byte(signature), []byte(expected))
 }
 
 // ─── HTTP Handlers ────────────────────────────────────────────
 
 type Handler struct {
-	svc *DeployService
+	svc           *DeployService
+	webhookSecret string
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
@@ -297,31 +458,165 @@ func (h *Handler) Rollback(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]string{"status": "rollback initiated"})
 }
 
+// RegisterService registers a new service with its git repo/branch mapping.
+func (h *Handler) RegisterService(w http.ResponseWriter, r *http.Request) {
+	var cfg ServiceConfig
+	if err := json.NewDecoder(r.Body).Decode(&cfg); err != nil {
+		writeJSON(w, 400, map[string]string{"error": "invalid request"})
+		return
+	}
+	if cfg.GitRepo == "" || cfg.GitBranch == "" {
+		writeJSON(w, 400, map[string]string{"error": "git_repo and git_branch are required"})
+		return
+	}
+	if cfg.Port == 0 {
+		cfg.Port = 8080
+	}
+	if cfg.ID == "" {
+		cfg.ID = uuid.NewString()
+	}
+	if cfg.Environment == "" {
+		cfg.Environment = "production"
+	}
+	cfg.CreatedAt = time.Now()
+	h.svc.svcRegistry.Save(&cfg)
+	log.Printf("[deploy] registered service %s (%s@%s)", cfg.ID, cfg.GitRepo, cfg.GitBranch)
+	writeJSON(w, 201, cfg)
+}
+
+func (h *Handler) ListServices(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, 200, h.svc.svcRegistry.List())
+}
+
+func (h *Handler) GetService(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	cfg, ok := h.svc.svcRegistry.Get(id)
+	if !ok {
+		writeJSON(w, 404, map[string]string{"error": "not found"})
+		return
+	}
+	writeJSON(w, 200, cfg)
+}
+
+func (h *Handler) DeleteService(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if _, ok := h.svc.svcRegistry.Get(id); !ok {
+		writeJSON(w, 404, map[string]string{"error": "not found"})
+		return
+	}
+	h.svc.svcRegistry.Delete(id)
+	writeJSON(w, 200, map[string]string{"status": "deleted"})
+}
+
+// GitHubWebhook handles GitHub push events and triggers a deploy for matching services.
+func (h *Handler) GitHubWebhook(w http.ResponseWriter, r *http.Request) {
+	if r.Header.Get("X-GitHub-Event") != "push" {
+		writeJSON(w, 200, map[string]string{
+			"status": "ignored",
+			"event":  r.Header.Get("X-GitHub-Event"),
+		})
+		return
+	}
+
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		writeJSON(w, 400, map[string]string{"error": "cannot read body"})
+		return
+	}
+
+	if h.webhookSecret != "" {
+		sig := r.Header.Get("X-Hub-Signature-256")
+		if !validateGitHubSignature(body, sig, h.webhookSecret) {
+			writeJSON(w, 401, map[string]string{"error": "invalid signature"})
+			return
+		}
+	}
+
+	var event GitHubPushEvent
+	if err := json.Unmarshal(body, &event); err != nil {
+		writeJSON(w, 400, map[string]string{"error": "invalid payload"})
+		return
+	}
+
+	branch := strings.TrimPrefix(event.Ref, "refs/heads/")
+
+	// Try HTTPS clone URL first, fall back to SSH URL
+	svc, ok := h.svc.svcRegistry.FindByRepo(event.Repository.CloneURL, branch)
+	if !ok {
+		svc, ok = h.svc.svcRegistry.FindByRepo(event.Repository.SSHURL, branch)
+	}
+	if !ok {
+		writeJSON(w, 200, map[string]string{
+			"status": "no matching service",
+			"repo":   event.Repository.CloneURL,
+			"branch": branch,
+		})
+		return
+	}
+
+	d, err := h.svc.TriggerDeploy(r.Context(), DeployRequest{
+		ServiceID:   svc.ID,
+		ProjectID:   svc.ProjectID,
+		GitRepo:     event.Repository.CloneURL,
+		GitBranch:   branch,
+		GitCommit:   event.HeadCommit.ID,
+		Environment: svc.Environment,
+		TriggeredBy: event.Pusher.Email,
+	})
+	if err != nil {
+		writeJSON(w, 500, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, 202, d)
+}
+
 // ─── Main ─────────────────────────────────────────────────────
 
 func main() {
 	cfg := loadConfig()
 
 	repo := NewDeploymentRepo()
+	svcRegistry := NewServiceRegistry()
 
 	bus, err := NewEventBus(cfg.NATSURL)
 	if err != nil {
 		log.Printf("warn: NATS unavailable (%v), running without event bus", err)
-		bus = &EventBus{} // no-op bus
+		bus = &EventBus{}
 	}
 
-	svc := NewDeployService(repo, bus)
+	svc := NewDeployService(repo, svcRegistry, bus)
 	svc.subscribeToEvents()
 
-	h := &Handler{svc: svc}
+	h := &Handler{svc: svc, webhookSecret: cfg.WebhookSecret}
 
 	mux := http.NewServeMux()
+
+	// Deployments
 	mux.HandleFunc("POST /api/v1/deployments", h.Deploy)
 	mux.HandleFunc("GET /api/v1/deployments/{id}", h.GetDeployment)
 	mux.HandleFunc("GET /api/v1/deployments", h.ListDeployments)
 	mux.HandleFunc("POST /api/v1/deployments/{id}/rollback", h.Rollback)
+
+	// Service registry
+	mux.HandleFunc("POST /api/v1/services", h.RegisterService)
+	mux.HandleFunc("GET /api/v1/services", h.ListServices)
+	mux.HandleFunc("GET /api/v1/services/{id}", h.GetService)
+	mux.HandleFunc("DELETE /api/v1/services/{id}", h.DeleteService)
+
+	// Git webhooks
+	mux.HandleFunc("POST /api/v1/webhooks/github", h.GitHubWebhook)
+
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, 200, map[string]string{"status": "ok", "service": "deploy"})
+		natsStatus := "connected"
+		if bus.nc == nil || !bus.nc.IsConnected() {
+			natsStatus = "disconnected"
+		}
+		writeJSON(w, 200, map[string]any{
+			"status":   "ok",
+			"service":  "deploy",
+			"nats":     natsStatus,
+			"services": len(svcRegistry.List()),
+		})
 	})
 
 	srv := &http.Server{

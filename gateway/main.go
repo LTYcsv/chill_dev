@@ -122,9 +122,10 @@ func isPublicRoute(path string) bool {
 		"/healthz",
 		"/api/v1/auth/login",
 		"/api/v1/auth/register",
+		"/api/v1/webhooks/github", // GitHub calls this directly, no JWT
 	}
 	for _, p := range public {
-		if path == p {
+		if path == p || strings.HasPrefix(path, p) {
 			return true
 		}
 	}
@@ -179,6 +180,9 @@ func buildRouter(cfg Config) http.Handler {
 	// Protected routes → downstream microservices
 	mux.Handle("/api/v1/deployments", newProxy(cfg.DeploySvcURL))
 	mux.Handle("/api/v1/deployments/", newProxy(cfg.DeploySvcURL))
+	mux.Handle("/api/v1/services", newProxy(cfg.DeploySvcURL))
+	mux.Handle("/api/v1/services/", newProxy(cfg.DeploySvcURL))
+	mux.Handle("/api/v1/webhooks/", newProxy(cfg.DeploySvcURL))
 
 	mux.Handle("/api/v1/builds", newProxy(cfg.BuildSvcURL))
 	mux.Handle("/api/v1/builds/", newProxy(cfg.BuildSvcURL))

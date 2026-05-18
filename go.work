@@ -4,8 +4,6 @@ use (
 	./services/auth
 	./services/deploy
 	./services/build
-	./services/runtime
-	./services/logs
 	./services/secrets
 	./services/graph
 	./gateway

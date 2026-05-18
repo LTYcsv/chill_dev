@@ -85,13 +85,17 @@ services:
   deploy:
     build:
       context: .
-      dockerfile: docker/Dockerfile.deploy
+      dockerfile: docker/Dockerfile.service
+      args:
+        SERVICE: deploy
     ports:
       - "8082:8082"
     environment:
       PORT: "8082"
       NATS_URL: nats://nats:4222
-      DATABASE_URL: postgres://devplatform:devplatform@postgres:5432/devplatform?sslmode=disable
+      WEBHOOK_SECRET: ${WEBHOOK_SECRET:-}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock  # for docker run
     depends_on:
       nats:
         condition: service_healthy
@@ -100,7 +104,9 @@ services:
   build:
     build:
       context: .
-      dockerfile: docker/Dockerfile.build
+      dockerfile: docker/Dockerfile.service
+      args:
+        SERVICE: build
     ports:
       - "8083:8083"
     environment:

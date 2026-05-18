@@ -102,4 +102,20 @@ smoke: ## Quick API smoke test
 	@echo "\n=== Health check ==="
 	@curl -s http://localhost:8080/healthz | jq .
 
+# ─── Deploy pipeline smoke test ───────────────────────────────
+smoke-deploy: ## Test Git→Build→Deploy pipeline end-to-end
+	@echo "=== Register service ==="
+	@curl -s -X POST http://localhost:8082/api/v1/services \
+		-H "Content-Type: application/json" \
+		-d '{"name":"demo","git_repo":"https://github.com/example/demo","git_branch":"main","port":3000,"environment":"production"}' | jq .
+	@echo "\n=== Trigger manual deploy ==="
+	@SVC_ID=$$(curl -s http://localhost:8082/api/v1/services | jq -r '.[0].id') && \
+	curl -s -X POST http://localhost:8082/api/v1/deployments \
+		-H "Content-Type: application/json" \
+		-d "{\"service_id\":\"$$SVC_ID\",\"project_id\":\"proj-1\",\"git_repo\":\"https://github.com/example/demo\",\"git_branch\":\"main\",\"environment\":\"production\",\"triggered_by\":\"test\"}" | jq .
+	@echo "\n=== Deploy service health ==="
+	@curl -s http://localhost:8082/healthz | jq .
+	@echo "\n=== Build service health ==="
+	@curl -s http://localhost:8083/healthz | jq .
+
 .DEFAULT_GOAL := help

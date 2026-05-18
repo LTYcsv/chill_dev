@@ -1,15 +1,17 @@
 ARG SERVICE=auth
 FROM golang:1.22-alpine AS builder
 RUN apk add --no-cache git ca-certificates
-WORKDIR /app
-COPY go.work go.work.sum* ./
-COPY services/${SERVICE}/ ./services/${SERVICE}/
 WORKDIR /app/services/${SERVICE}
-RUN go mod download
-RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /service .
 
-FROM scratch
-COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
+# Copy only the target service (GOWORK=off builds it as standalone module)
+COPY services/${SERVICE}/go.mod services/${SERVICE}/go.sum* ./
+RUN GOWORK=off go mod download
+
+COPY services/${SERVICE}/ ./
+RUN GOWORK=off CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /service .
+
+FROM alpine:latest
+RUN apk add --no-cache ca-certificates docker-cli
 COPY --from=builder /service /service
 EXPOSE 8080
 ENTRYPOINT ["/service"]
