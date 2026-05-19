@@ -114,9 +114,14 @@ func cmdDeploy(client *Client, args []string) {
 	branch := flagString(args, "--branch", "main")
 	gitRepo := flagString(args, "--repo", "")
 	watch := flagBool(args, "--watch")
+	skipBlast := flagBool(args, "--skip-blast-radius")
 
 	if serviceID == "" {
 		fatal("--service is required")
+	}
+
+	if !skipBlast {
+		checkBlastRadiusForDeploy(client, serviceID)
 	}
 
 	payload := map[string]string{
@@ -145,6 +150,39 @@ func cmdDeploy(client *Client, args []string) {
 	} else {
 		fmt.Printf("\nTrack: devp status --deployment %s\n", result["id"])
 	}
+}
+
+// checkBlastRadiusForDeploy fetches the service name then queries the graph service.
+// Prints a warning if the service has upstream dependents. Never blocks or fails the deploy.
+func checkBlastRadiusForDeploy(client *Client, serviceID string) {
+	var svc map[string]interface{}
+	if err := client.JSON("GET", "/api/v1/services/"+serviceID, nil, &svc); err != nil {
+		return // service lookup failed — don't block deploy
+	}
+	name, _ := svc["name"].(string)
+	if name == "" {
+		return
+	}
+
+	var blast blastRadiusResult
+	if err := client.JSON("GET", "/api/v1/graph/blast-radius/"+name, nil, &blast); err != nil {
+		return // graph service unavailable — don't block deploy
+	}
+	if blast.NodeName == "" || blast.TotalAffected == 0 {
+		return // node not in graph or no dependents
+	}
+
+	icon := severityIcon(blast.Severity)
+	fmt.Printf("%s Blast Radius Warning — severity: %s\n", icon, strings.ToUpper(blast.Severity))
+	fmt.Printf("   Deploying \"%s\" may affect %d service(s):\n", blast.NodeName, blast.TotalAffected)
+	for _, n := range blast.AffectedNodes {
+		label := "transitive"
+		if n.Depth == 1 {
+			label = "direct"
+		}
+		fmt.Printf("   • %s [%s, depth %d]\n", n.Name, label, n.Depth)
+	}
+	fmt.Println()
 }
 
 func watchDeployment(client *Client, deploymentID string) {
@@ -403,10 +441,89 @@ func cmdServices(client *Client, args []string) {
 	}
 }
 
+// ─── Blast Radius ─────────────────────────────────────────────
+
+type affectedNode struct {
+	ID    string `json:"id"`
+	Name  string `json:"name"`
+	Type  string `json:"type"`
+	Depth int    `json:"depth"`
+}
+
+type blastRadiusResult struct {
+	NodeID        string         `json:"node_id"`
+	NodeName      string         `json:"node_name"`
+	AffectedNodes []affectedNode `json:"affected_nodes"`
+	TotalAffected int            `json:"total_affected"`
+	Severity      string         `json:"severity"`
+}
+
+func cmdBlastRadius(client *Client, args []string) {
+	node := flagString(args, "--node", "")
+	if node == "" && len(args) > 0 && !strings.HasPrefix(args[0], "--") {
+		node = args[0]
+	}
+	if node == "" {
+		fatal("usage: devp blast-radius <node-id-or-name>")
+	}
+
+	var result blastRadiusResult
+	if err := client.JSON("GET", "/api/v1/graph/blast-radius/"+node, nil, &result); err != nil {
+		fatal(err.Error())
+	}
+
+	if result.NodeName == "" {
+		fmt.Printf("Node \"%s\" not found in infrastructure graph.\n", node)
+		return
+	}
+
+	icon := severityIcon(result.Severity)
+	fmt.Printf("%s Blast radius for: %s (%s)\n", icon, result.NodeName, result.NodeID)
+	fmt.Printf("   Severity:       %s\n", strings.ToUpper(result.Severity))
+	fmt.Printf("   Total affected: %d\n", result.TotalAffected)
+
+	if result.TotalAffected == 0 {
+		fmt.Println("\n   No upstream dependents — safe to deploy.")
+		return
+	}
+
+	// Group by depth
+	byDepth := make(map[int][]affectedNode)
+	maxDepth := 0
+	for _, n := range result.AffectedNodes {
+		byDepth[n.Depth] = append(byDepth[n.Depth], n)
+		if n.Depth > maxDepth {
+			maxDepth = n.Depth
+		}
+	}
+
+	fmt.Println()
+	for d := 1; d <= maxDepth; d++ {
+		nodes := byDepth[d]
+		if len(nodes) == 0 {
+			continue
+		}
+		label := "direct dependents"
+		if d > 1 {
+			label = fmt.Sprintf("transitive (depth %d)", d)
+		}
+		fmt.Printf("   %s:\n", label)
+		for _, n := range nodes {
+			fmt.Printf("     • %s  [%s]\n", n.Name, n.Type)
+		}
+	}
+}
+
 func cmdGraph(client *Client, args []string) {
+	if len(args) > 0 && args[0] == "timeline" {
+		cmdGraphTimeline(client, args[1:])
+		return
+	}
+
 	projectID := flagString(args, "--project", "demo")
 	env := flagString(args, "--env", "production")
 	blastNode := flagString(args, "--blast-radius", "")
+	atStr := flagString(args, "--at", "")
 
 	if blastNode != "" {
 		var result map[string]interface{}
@@ -424,13 +541,26 @@ func cmdGraph(client *Client, args []string) {
 		return
 	}
 
+	path := fmt.Sprintf("/api/v1/graph?project_id=%s&env=%s", projectID, env)
+	label := "current"
+	if atStr != "" {
+		at, err := parseRelTime(atStr)
+		if err != nil {
+			fatal("invalid --at value: " + err.Error())
+		}
+		path += "&at=" + at.UTC().Format(time.RFC3339)
+		label = "at " + at.UTC().Format("2006-01-02 15:04:05 UTC")
+	}
+
 	var graph map[string]interface{}
-	if err := client.JSON("GET", fmt.Sprintf("/api/v1/graph?project_id=%s&env=%s", projectID, env), nil, &graph); err != nil {
+	if err := client.JSON("GET", path, nil, &graph); err != nil {
 		fatal(err.Error())
 	}
 
 	nodes, _ := graph["nodes"].([]interface{})
 	edges, _ := graph["edges"].([]interface{})
+
+	fmt.Printf("Infrastructure graph (%s)\n\n", label)
 
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
 	fmt.Fprintf(w, "NODE\tTYPE\tSTATUS\n")
@@ -449,6 +579,79 @@ func cmdGraph(client *Client, args []string) {
 		fmt.Printf("  %s → %s [%s] %v rps\n",
 			edge["from"], edge["to"], edge["protocol"], edge["rps"])
 	}
+}
+
+func cmdGraphTimeline(client *Client, args []string) {
+	projectID := flagString(args, "--project", "demo")
+	env := flagString(args, "--env", "production")
+	limit := flagString(args, "--limit", "20")
+
+	var diffs []map[string]interface{}
+	path := fmt.Sprintf("/api/v1/graph/timeline?project_id=%s&env=%s&limit=%s", projectID, env, limit)
+	if err := client.JSON("GET", path, nil, &diffs); err != nil {
+		fatal(err.Error())
+	}
+
+	if len(diffs) == 0 {
+		fmt.Println("No changes recorded yet.")
+		return
+	}
+
+	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+	fmt.Fprintf(w, "TIME\tSOURCE\tOP\tTARGET\n")
+	fmt.Fprintf(w, "────\t──────\t──\t──────\n")
+	for _, d := range diffs {
+		ts, _ := d["created_at"].(string)
+		if len(ts) > 19 {
+			ts = ts[:19]
+		}
+		source, _ := d["source"].(string)
+		diff, _ := d["diff"].(map[string]interface{})
+		op, _ := diff["op"].(string)
+		target := ""
+		if node, ok := diff["node"].(map[string]interface{}); ok {
+			name, _ := node["name"].(string)
+			status, _ := node["status"].(string)
+			target = fmt.Sprintf("%s (%s)", name, status)
+		} else if nodeID, ok := diff["node_id"].(string); ok {
+			target = nodeID
+		} else if edge, ok := diff["edge"].(map[string]interface{}); ok {
+			from, _ := edge["from"].(string)
+			to, _ := edge["to"].(string)
+			target = fmt.Sprintf("%s → %s", from, to)
+		} else if edgeID, ok := diff["edge_id"].(string); ok {
+			target = edgeID
+		}
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", ts, source, op, target)
+	}
+	w.Flush()
+}
+
+// parseRelTime parses RFC3339 or relative formats like "2h ago", "30m ago", "1d ago".
+func parseRelTime(s string) (time.Time, error) {
+	// Try RFC3339 first
+	if t, err := time.Parse(time.RFC3339, s); err == nil {
+		return t, nil
+	}
+	// Try "Xh ago", "Xm ago", "Xd ago"
+	s = strings.TrimSuffix(strings.TrimSpace(s), " ago")
+	if len(s) < 2 {
+		return time.Time{}, fmt.Errorf("use RFC3339 or relative format like '2h ago', '30m ago', '1d ago'")
+	}
+	unit := s[len(s)-1]
+	var val int
+	if _, err := fmt.Sscanf(s[:len(s)-1], "%d", &val); err != nil {
+		return time.Time{}, fmt.Errorf("use RFC3339 or relative format like '2h ago', '30m ago', '1d ago'")
+	}
+	switch unit {
+	case 'h':
+		return time.Now().Add(-time.Duration(val) * time.Hour), nil
+	case 'm':
+		return time.Now().Add(-time.Duration(val) * time.Minute), nil
+	case 'd':
+		return time.Now().Add(-time.Duration(val) * 24 * time.Hour), nil
+	}
+	return time.Time{}, fmt.Errorf("unknown unit %q, use h/m/d", string(unit))
 }
 
 func cmdSecrets(client *Client, args []string) {
@@ -551,6 +754,19 @@ func statusIcon(status string) string {
 	}
 }
 
+func severityIcon(severity string) string {
+	switch severity {
+	case "critical":
+		return "[!!]"
+	case "high":
+		return "[!]"
+	case "medium":
+		return "[~]"
+	default:
+		return "[i]"
+	}
+}
+
 func nodeIcon(nodeType string) string {
 	switch nodeType {
 	case "service":
@@ -591,6 +807,8 @@ func main() {
 		cmdServices(client, args)
 	case "graph":
 		cmdGraph(client, args)
+	case "blast-radius":
+		cmdBlastRadius(client, args)
 	case "secrets":
 		cmdSecrets(client, args)
 	case "login":
@@ -615,14 +833,15 @@ func printUsage() {
 Usage: devp <command> [options]
 
 Commands:
-  login      Authenticate with the platform
-  deploy     Trigger a deployment
-  status     Check deployment status
-  logs       View or stream service logs
-  services   Manage service registry
-  graph      View infrastructure graph
-  secrets    Manage environment secrets
-  health     Check platform health
+  login         Authenticate with the platform
+  deploy        Trigger a deployment
+  status        Check deployment status
+  logs          View or stream service logs
+  services      Manage service registry
+  graph         View infrastructure graph
+  blast-radius  Analyse upstream impact of deploying a node
+  secrets       Manage environment secrets
+  health        Check platform health
 
 Examples:
   devp login --email you@company.com --password secret
@@ -631,7 +850,7 @@ Examples:
   devp services list
   devp services delete --id <id>
 
-  devp deploy --service <id> --env production [--watch]
+  devp deploy --service <id> --env production [--watch] [--skip-blast-radius]
   devp status --deployment <id>
 
   devp logs --service <id> --tail 50
@@ -639,7 +858,13 @@ Examples:
   devp logs --deployment <id> --follow
 
   devp graph --project myapp --env production
+  devp graph --at "2h ago"              # time travel: graph state 2 hours ago
+  devp graph --at 2026-05-19T10:00:00Z  # time travel: graph at specific time
+  devp graph timeline --project myapp   # show change history
   devp graph --blast-radius postgres-main
+
+  devp blast-radius postgres-main
+  devp blast-radius postgres          # lookup by name also works
 
   devp secrets set DATABASE_URL postgres://... --service <id> --env-id prod
   devp secrets list --service <id> --env-id prod
