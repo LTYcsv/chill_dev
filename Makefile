@@ -1,4 +1,4 @@
-.PHONY: help dev stop logs ps build test lint migrate
+.PHONY: help dev stop logs ps build test lint migrate ngrok webhook-url webhook-test pipeline-test
 
 SERVICES := auth deploy build logs secrets graph
 GATEWAY  := gateway
@@ -16,7 +16,8 @@ dev: ## Start full local stack
 	@$(MAKE) run-all
 
 run-all: ## Run all services locally (not in Docker)
-	@for svc in $(SERVICES); do \
+	@export REGISTRY_HOST=localhost:5001 && \
+	for svc in $(SERVICES); do \
 		echo "Starting $$svc..."; \
 		cd services/$$svc && go run . & \
 		cd ../..; \
@@ -117,5 +118,56 @@ smoke-deploy: ## Test Git→Build→Deploy pipeline end-to-end
 	@curl -s http://localhost:8082/healthz | jq .
 	@echo "\n=== Build service health ==="
 	@curl -s http://localhost:8083/healthz | jq .
+
+# ─── ngrok / webhook dev ──────────────────────────────────────
+ngrok: ## Start ngrok tunnel on :8080 and print GitHub webhook URL
+	@pkill ngrok 2>/dev/null; true
+	@ngrok http 8080 > /dev/null &
+	@echo "Waiting for ngrok..."
+	@sleep 2
+	@URL=$$(curl -s http://localhost:4040/api/tunnels | jq -r '.tunnels[] | select(.proto=="https") | .public_url') && \
+	HOOK="$$URL/api/v1/webhooks/github" && \
+	echo "" && \
+	echo "  Tunnel:   $$URL" && \
+	echo "  Webhook:  $$HOOK" && \
+	echo "" && \
+	echo "GitHub → repo → Settings → Webhooks → Add webhook" && \
+	echo "  Payload URL:  $$HOOK" && \
+	echo "  Content type: application/json" && \
+	echo "  Secret:       $${WEBHOOK_SECRET:-(not set — set WEBHOOK_SECRET env var)}"
+
+webhook-url: ## Print current ngrok webhook URL (ngrok must already be running)
+	@URL=$$(curl -s http://localhost:4040/api/tunnels | jq -r '.tunnels[] | select(.proto=="https") | .public_url') && \
+	echo "$$URL/api/v1/webhooks/github"
+
+webhook-test: ## Simulate a GitHub push event locally (REPO=<url> BRANCH=<branch>)
+	@REPO=$${REPO:-} && BRANCH=$${BRANCH:-main} && \
+	[ -n "$$REPO" ] || (echo "Usage: make webhook-test REPO=https://github.com/user/repo" && exit 1) && \
+	echo "Simulating push: $$REPO @ $$BRANCH" && \
+	curl -s -X POST http://localhost:8080/api/v1/webhooks/github \
+		-H "Content-Type: application/json" \
+		-H "X-GitHub-Event: push" \
+		-d "{\"ref\":\"refs/heads/$$BRANCH\",\"repository\":{\"clone_url\":\"$$REPO\",\"ssh_url\":\"$$REPO\"},\"head_commit\":{\"id\":\"$$(date +%s)\",\"message\":\"test deploy\"},\"pusher\":{\"name\":\"dev\",\"email\":\"dev@localhost\"}}" | jq .
+
+# ─── Full pipeline test ───────────────────────────────────────
+pipeline-test: ## Register service + trigger deploy (REPO=<https url> BRANCH=<branch>)
+	@REPO=$${REPO:-} && BRANCH=$${BRANCH:-main} && \
+	[ -n "$$REPO" ] || (echo "Usage: make pipeline-test REPO=https://github.com/user/repo" && exit 1) && \
+	echo "=== Register service ===" && \
+	RESULT=$$(curl -s -X POST http://localhost:8082/api/v1/services \
+		-H "Content-Type: application/json" \
+		-d "{\"name\":\"pipeline-test\",\"git_repo\":\"$$REPO\",\"git_branch\":\"$$BRANCH\",\"port\":3000,\"environment\":\"production\"}") && \
+	echo "$$RESULT" | jq . && \
+	SVC_ID=$$(echo "$$RESULT" | jq -r .id) && \
+	echo "" && \
+	echo "=== Trigger deploy ===" && \
+	DEPLOY=$$(curl -s -X POST http://localhost:8082/api/v1/deployments \
+		-H "Content-Type: application/json" \
+		-d "{\"service_id\":\"$$SVC_ID\",\"git_repo\":\"$$REPO\",\"git_branch\":\"$$BRANCH\",\"environment\":\"production\",\"triggered_by\":\"make pipeline-test\"}") && \
+	echo "$$DEPLOY" | jq . && \
+	DEPLOY_ID=$$(echo "$$DEPLOY" | jq -r .id) && \
+	echo "" && \
+	echo "Watch logs:  devp logs --deployment $$DEPLOY_ID --follow" && \
+	echo "Poll status: curl -s http://localhost:8082/api/v1/deployments/$$DEPLOY_ID | jq .status"
 
 .DEFAULT_GOAL := help
