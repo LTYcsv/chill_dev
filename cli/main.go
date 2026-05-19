@@ -212,13 +212,20 @@ func cmdStatus(client *Client, args []string) {
 
 func cmdLogs(client *Client, args []string) {
 	serviceID := flagString(args, "--service", "")
+	deploymentID := flagString(args, "--deployment", "")
 	tail := flagString(args, "--tail", "100")
 	follow := flagBool(args, "--follow")
 
-	if serviceID == "" {
-		fatal("--service is required")
+	if serviceID == "" && deploymentID == "" {
+		fatal("--service or --deployment is required")
 	}
 
+	if deploymentID != "" {
+		cmdDeploymentLogs(client, deploymentID, follow)
+		return
+	}
+
+	// Container runtime logs
 	if follow {
 		path := fmt.Sprintf("/api/v1/logs?service_id=%s&tail=%s&follow=true", serviceID, tail)
 		resp, err := client.stream(path)
@@ -226,17 +233,14 @@ func cmdLogs(client *Client, args []string) {
 			fatal("failed to connect: " + err.Error())
 		}
 		defer resp.Body.Close()
-
 		if resp.StatusCode >= 400 {
 			var errResp map[string]string
 			json.NewDecoder(resp.Body).Decode(&errResp)
 			fatal(fmt.Sprintf("API error %d: %s", resp.StatusCode, errResp["error"]))
 		}
-
 		sc := bufio.NewScanner(resp.Body)
 		for sc.Scan() {
-			line := sc.Text()
-			if strings.HasPrefix(line, "data: ") {
+			if line := sc.Text(); strings.HasPrefix(line, "data: ") {
 				fmt.Println(strings.TrimPrefix(line, "data: "))
 			}
 		}
@@ -247,15 +251,66 @@ func cmdLogs(client *Client, args []string) {
 	}
 
 	var result map[string]interface{}
-	path := fmt.Sprintf("/api/v1/logs?service_id=%s&tail=%s", serviceID, tail)
-	if err := client.JSON("GET", path, nil, &result); err != nil {
+	if err := client.JSON("GET", fmt.Sprintf("/api/v1/logs?service_id=%s&tail=%s", serviceID, tail), nil, &result); err != nil {
 		fatal(err.Error())
 	}
-
-	lines, _ := result["lines"].([]interface{})
-	for _, l := range lines {
+	for _, l := range result["lines"].([]interface{}) {
 		fmt.Println(l)
 	}
+}
+
+// cmdDeploymentLogs streams or dumps pipeline logs (build + deploy events) for a deployment.
+func cmdDeploymentLogs(client *Client, deploymentID string, follow bool) {
+	path := "/api/v1/logs/deployment/" + deploymentID
+	if !follow {
+		var result map[string]interface{}
+		if err := client.JSON("GET", path, nil, &result); err != nil {
+			fatal(err.Error())
+		}
+		lines, _ := result["lines"].([]interface{})
+		for _, l := range lines {
+			if entry, ok := l.(map[string]interface{}); ok {
+				printLogEntry(entry)
+			}
+		}
+		return
+	}
+
+	resp, err := client.stream(path + "?follow=true")
+	if err != nil {
+		fatal("failed to connect: " + err.Error())
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		var errResp map[string]string
+		json.NewDecoder(resp.Body).Decode(&errResp)
+		fatal(fmt.Sprintf("API error %d: %s", resp.StatusCode, errResp["error"]))
+	}
+
+	sc := bufio.NewScanner(resp.Body)
+	for sc.Scan() {
+		raw := sc.Text()
+		switch {
+		case strings.HasPrefix(raw, "data: "):
+			var entry map[string]interface{}
+			if err := json.Unmarshal([]byte(strings.TrimPrefix(raw, "data: ")), &entry); err == nil {
+				printLogEntry(entry)
+			}
+		case strings.HasPrefix(raw, "event: done"):
+			fmt.Println("--- deployment finished ---")
+			return
+		}
+	}
+}
+
+func printLogEntry(entry map[string]interface{}) {
+	ts, _ := entry["ts"].(string)
+	if len(ts) > 19 {
+		ts = ts[:19] // trim to seconds: 2006-01-02T15:04:05
+	}
+	source, _ := entry["source"].(string)
+	line, _ := entry["line"].(string)
+	fmt.Printf("%s [%s] %s\n", ts, source, line)
 }
 
 func cmdServices(client *Client, args []string) {
@@ -581,6 +636,7 @@ Examples:
 
   devp logs --service <id> --tail 50
   devp logs --service <id> --follow
+  devp logs --deployment <id> --follow
 
   devp graph --project myapp --env production
   devp graph --blast-radius postgres-main

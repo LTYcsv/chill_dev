@@ -1,9 +1,11 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -54,69 +56,107 @@ func NewBuilder(registryHost string, nc *nats.Conn) *Builder {
 	return &Builder{registryHost: registryHost, nc: nc}
 }
 
+// publishLogLine sends a single log line to the logs service via NATS.
+func (b *Builder) publishLogLine(deploymentID, line string) {
+	if b.nc == nil {
+		return
+	}
+	data, _ := json.Marshal(map[string]string{
+		"deployment_id": deploymentID,
+		"line":          line,
+		"source":        "build",
+		"ts":            time.Now().UTC().Format(time.RFC3339),
+	})
+	b.nc.Publish("logs.line."+deploymentID, data)
+}
+
+// runAndStream runs a command, streams each output line to NATS, and returns
+// the command's exit error. stdout and stderr are merged.
+func (b *Builder) runAndStream(ctx context.Context, deploymentID string, args ...string) error {
+	cmd := exec.CommandContext(ctx, args[0], args[1:]...)
+
+	pr, pw := io.Pipe()
+	cmd.Stdout = pw
+	cmd.Stderr = pw
+
+	if err := cmd.Start(); err != nil {
+		pw.Close()
+		return err
+	}
+
+	errCh := make(chan error, 1)
+	go func() {
+		err := cmd.Wait()
+		pw.Close()
+		errCh <- err
+	}()
+
+	sc := bufio.NewScanner(pr)
+	for sc.Scan() {
+		line := sc.Text()
+		log.Printf("[build:%s] %s", deploymentID[:8], line)
+		b.publishLogLine(deploymentID, line)
+	}
+
+	return <-errCh
+}
+
 func (b *Builder) Build(ctx context.Context, req BuildRequest) {
-	log.Printf("[build] starting build for deployment %s", req.DeploymentID)
+	log.Printf("[build] starting deployment %s", req.DeploymentID)
+	b.publishLogLine(req.DeploymentID, fmt.Sprintf("build started: %s @ %s", req.GitRepo, req.GitBranch))
 
 	imageTag := fmt.Sprintf("%s/%s:%s", b.registryHost, req.ServiceID, req.DeploymentID[:8])
 
-	// 1. Clone repo
-	if err := b.cloneRepo(ctx, req.GitRepo, req.GitBranch, req.DeploymentID); err != nil {
+	b.publishLogLine(req.DeploymentID, "cloning repository...")
+	if err := b.cloneRepo(ctx, req); err != nil {
 		b.publishFailed(req.DeploymentID, "clone failed: "+err.Error())
 		return
 	}
 
-	// 2. Build Docker image
-	if err := b.buildImage(ctx, req.DeploymentID, imageTag); err != nil {
+	b.publishLogLine(req.DeploymentID, "building Docker image: "+imageTag)
+	if err := b.buildImage(ctx, req, imageTag); err != nil {
 		b.publishFailed(req.DeploymentID, "build failed: "+err.Error())
 		return
 	}
 
-	// 3. Push to registry
-	if err := b.pushImage(ctx, imageTag); err != nil {
+	b.publishLogLine(req.DeploymentID, "pushing image to registry...")
+	if err := b.pushImage(ctx, req, imageTag); err != nil {
 		b.publishFailed(req.DeploymentID, "push failed: "+err.Error())
 		return
 	}
 
-	// 4. Cleanup
 	os.RemoveAll("/tmp/build-" + req.DeploymentID)
-
 	b.publishCompleted(req.DeploymentID, imageTag)
 }
 
-func (b *Builder) cloneRepo(ctx context.Context, repo, branch, deployID string) error {
-	dir := "/tmp/build-" + deployID
-	cmd := exec.CommandContext(ctx, "git", "clone", "--depth=1", "--branch", branch, repo, dir)
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("%w: %s", err, string(out))
-	}
-	log.Printf("[build] cloned %s@%s", repo, branch)
-	return nil
+func (b *Builder) cloneRepo(ctx context.Context, req BuildRequest) error {
+	dir := "/tmp/build-" + req.DeploymentID
+	return b.runAndStream(ctx, req.DeploymentID,
+		"git", "clone", "--depth=1", "--branch", req.GitBranch, req.GitRepo, dir)
 }
 
-func (b *Builder) buildImage(ctx context.Context, deployID, imageTag string) error {
-	dir := "/tmp/build-" + deployID
+func (b *Builder) buildImage(ctx context.Context, req BuildRequest, imageTag string) error {
+	dir := "/tmp/build-" + req.DeploymentID
 
-	// Auto-detect: use Dockerfile if exists, else Buildpacks (simplified here)
-	dockerfilePath := dir + "/Dockerfile"
-	if _, err := os.Stat(dockerfilePath); os.IsNotExist(err) {
-		log.Printf("[build] no Dockerfile found, generating default for %s", deployID)
+	if _, err := os.Stat(dir + "/Dockerfile"); os.IsNotExist(err) {
+		b.publishLogLine(req.DeploymentID, "no Dockerfile found, generating default")
 		if err := b.generateDockerfile(dir); err != nil {
 			return err
 		}
 	}
 
-	cmd := exec.CommandContext(ctx, "docker", "build", "-t", imageTag, dir)
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("%w: %s", err, string(out))
+	return b.runAndStream(ctx, req.DeploymentID, "docker", "build", "-t", imageTag, dir)
+}
+
+func (b *Builder) pushImage(ctx context.Context, req BuildRequest, imageTag string) error {
+	if err := b.runAndStream(ctx, req.DeploymentID, "docker", "push", imageTag); err != nil {
+		// In dev mode, registry may not be reachable — warn but don't fail.
+		b.publishLogLine(req.DeploymentID, "warn: push failed (dev mode?): "+err.Error())
 	}
-	log.Printf("[build] image built: %s", imageTag)
 	return nil
 }
 
 func (b *Builder) generateDockerfile(dir string) error {
-	// Simple heuristic: detect project type
 	var dockerfile string
 
 	if _, err := os.Stat(dir + "/go.mod"); err == nil {
@@ -152,18 +192,6 @@ CMD ["python", "main.py"]`
 	return os.WriteFile(dir+"/Dockerfile", []byte(dockerfile), 0644)
 }
 
-func (b *Builder) pushImage(ctx context.Context, imageTag string) error {
-	// Skip push in local dev if registry not available
-	cmd := exec.CommandContext(ctx, "docker", "push", imageTag)
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		// In dev mode, log warning but don't fail
-		log.Printf("[build] warn: push failed (dev mode?): %s", string(out))
-		return nil
-	}
-	return nil
-}
-
 func (b *Builder) publishCompleted(deploymentID, imageTag string) {
 	if b.nc == nil {
 		return
@@ -177,7 +205,7 @@ func (b *Builder) publishCompleted(deploymentID, imageTag string) {
 }
 
 func (b *Builder) publishFailed(deploymentID, reason string) {
-	log.Printf("[build] failed: %s - %s", deploymentID, reason)
+	log.Printf("[build] failed: %s — %s", deploymentID, reason)
 	if b.nc == nil {
 		return
 	}
@@ -188,7 +216,7 @@ func (b *Builder) publishFailed(deploymentID, reason string) {
 	b.nc.Publish("build.failed", data)
 }
 
-// ─── Worker loop ──────────────────────────────────────────────
+// ─── Worker ───────────────────────────────────────────────────
 
 func startWorker(builder *Builder, nc *nats.Conn) {
 	if nc == nil {
@@ -201,13 +229,12 @@ func startWorker(builder *Builder, nc *nats.Conn) {
 			log.Printf("[build] invalid message: %v", err)
 			return
 		}
-		// Run in goroutine so we don't block NATS subscription
 		go builder.Build(context.Background(), req)
 	})
 	log.Println("[build] worker subscribed to build.requested")
 }
 
-// ─── HTTP (health + manual trigger) ──────────────────────────
+// ─── HTTP ─────────────────────────────────────────────────────
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
@@ -233,7 +260,6 @@ func main() {
 
 	mux := http.NewServeMux()
 
-	// Manual trigger (useful for testing without NATS)
 	mux.HandleFunc("POST /api/v1/builds", func(w http.ResponseWriter, r *http.Request) {
 		var req BuildRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -250,18 +276,18 @@ func main() {
 			natsStatus = "disconnected"
 		}
 		writeJSON(w, 200, map[string]string{
-			"status":      "ok",
-			"service":     "build",
-			"nats":        natsStatus,
-			"registry":    cfg.RegistryHost,
-			"docker":      detectDocker(),
+			"status":   "ok",
+			"service":  "build",
+			"nats":     natsStatus,
+			"registry": cfg.RegistryHost,
+			"docker":   detectDocker(),
 		})
 	})
 
 	srv := &http.Server{
-		Addr:        ":" + cfg.Port,
-		Handler:     mux,
-		ReadTimeout: 5 * time.Second,
+		Addr:         ":" + cfg.Port,
+		Handler:      mux,
+		ReadTimeout:  5 * time.Second,
 		WriteTimeout: 10 * time.Second,
 	}
 

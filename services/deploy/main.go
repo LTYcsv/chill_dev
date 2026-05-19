@@ -263,6 +263,20 @@ func NewDeployService(repo *DeploymentRepo, svcRegistry *ServiceRegistry, bus *E
 	return &DeployService{repo: repo, svcRegistry: svcRegistry, bus: bus, secretsSvcURL: secretsSvcURL}
 }
 
+// updateStatus updates deployment status in the repo and publishes the log line
+// to NATS so the logs service can stream it to CLI subscribers.
+func (s *DeployService) updateStatus(deploymentID string, status DeploymentStatus, logLine string) {
+	s.repo.UpdateStatus(deploymentID, status, logLine)
+	if logLine != "" {
+		s.bus.Publish("logs.line."+deploymentID, map[string]string{
+			"deployment_id": deploymentID,
+			"line":          logLine,
+			"source":        "deploy",
+			"ts":            time.Now().UTC().Format(time.RFC3339),
+		})
+	}
+}
+
 // fetchSecretEnvVars calls the secrets service and returns a KEY=VALUE map for
 // the given serviceID + environment. Returns empty map (not an error) if the
 // secrets service is unreachable — deployments must not fail due to missing secrets svc.
@@ -308,7 +322,7 @@ func (s *DeployService) TriggerDeploy(ctx context.Context, req DeployRequest) (*
 		log.Printf("warn: failed to publish build.requested: %v", err)
 	}
 
-	s.repo.UpdateStatus(d.ID, StatusBuilding, "build requested")
+	s.updateStatus(d.ID, StatusBuilding, "build requested")
 	log.Printf("[deploy] triggered deployment %s for service %s", d.ID, d.ServiceID)
 	return d, nil
 }
@@ -318,7 +332,7 @@ func (s *DeployService) Rollback(ctx context.Context, deploymentID string) error
 	if !ok {
 		return fmt.Errorf("deployment not found")
 	}
-	s.repo.UpdateStatus(d.ID, StatusRolledBack, "manual rollback triggered")
+	s.updateStatus(d.ID, StatusRolledBack, "manual rollback triggered")
 	s.bus.Publish("deploy.rollback", map[string]string{
 		"deployment_id": d.ID,
 		"service_id":    d.ServiceID,
@@ -363,7 +377,7 @@ func (s *DeployService) subscribeToEvents() {
 			log.Printf("[deploy] build.completed: deployment %s not found", deployID)
 			return
 		}
-		s.repo.UpdateStatus(deployID, StatusDeploying, "build complete, starting container")
+		s.updateStatus(deployID, StatusDeploying, "build complete, starting container")
 
 		port := 8080
 		if cfg, ok := s.svcRegistry.Get(d.ServiceID); ok {
@@ -377,7 +391,7 @@ func (s *DeployService) subscribeToEvents() {
 			envVars := s.fetchSecretEnvVars(d.ServiceID, d.Environment)
 			if err := s.runContainer(ctx, imageTag, d.ServiceID, port, envVars); err != nil {
 				log.Printf("[deploy] container run failed for %s: %v", deployID, err)
-				s.repo.UpdateStatus(deployID, StatusFailed, "container run failed: "+err.Error())
+				s.updateStatus(deployID, StatusFailed, "container run failed: "+err.Error())
 				s.bus.Publish("deploy.failed", map[string]string{
 					"deployment_id": deployID,
 					"service_id":    d.ServiceID,
@@ -385,7 +399,7 @@ func (s *DeployService) subscribeToEvents() {
 				})
 				return
 			}
-			s.repo.UpdateStatus(deployID, StatusSuccess,
+			s.updateStatus(deployID, StatusSuccess,
 				fmt.Sprintf("container running on port %d", port))
 			s.bus.Publish("runtime.deployed", map[string]string{
 				"deployment_id": deployID,
@@ -399,7 +413,7 @@ func (s *DeployService) subscribeToEvents() {
 		if err := json.Unmarshal(data, &payload); err != nil {
 			return
 		}
-		s.repo.UpdateStatus(payload["deployment_id"], StatusFailed,
+		s.updateStatus(payload["deployment_id"], StatusFailed,
 			"build failed: "+payload["error"])
 	})
 }
