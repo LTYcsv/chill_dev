@@ -1,11 +1,11 @@
 go 1.22
 
 use (
-	./services/auth
-	./services/deploy
-	./services/build
-	./services/secrets
-	./services/graph
-	./gateway
 	./cli
+	./gateway
+	./services/auth
+	./services/build
+	./services/deploy
+	./services/graph
+	./services/secrets
 )

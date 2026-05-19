@@ -26,6 +26,7 @@ type Config struct {
 	Port          string
 	NATSURL       string
 	WebhookSecret string
+	SecretsSvcURL string
 }
 
 func loadConfig() Config {
@@ -33,6 +34,7 @@ func loadConfig() Config {
 		Port:          getEnv("PORT", "8082"),
 		NATSURL:       getEnv("NATS_URL", "nats://localhost:4222"),
 		WebhookSecret: getEnv("WEBHOOK_SECRET", ""),
+		SecretsSvcURL: getEnv("SECRETS_SVC_URL", "http://localhost:8086"),
 	}
 }
 
@@ -251,13 +253,34 @@ func (b *EventBus) Subscribe(subject string, handler func(data []byte)) error {
 // ─── Deploy Service ───────────────────────────────────────────
 
 type DeployService struct {
-	repo        *DeploymentRepo
-	svcRegistry *ServiceRegistry
-	bus         *EventBus
+	repo          *DeploymentRepo
+	svcRegistry   *ServiceRegistry
+	bus           *EventBus
+	secretsSvcURL string
 }
 
-func NewDeployService(repo *DeploymentRepo, svcRegistry *ServiceRegistry, bus *EventBus) *DeployService {
-	return &DeployService{repo: repo, svcRegistry: svcRegistry, bus: bus}
+func NewDeployService(repo *DeploymentRepo, svcRegistry *ServiceRegistry, bus *EventBus, secretsSvcURL string) *DeployService {
+	return &DeployService{repo: repo, svcRegistry: svcRegistry, bus: bus, secretsSvcURL: secretsSvcURL}
+}
+
+// fetchSecretEnvVars calls the secrets service and returns a KEY=VALUE map for
+// the given serviceID + environment. Returns empty map (not an error) if the
+// secrets service is unreachable — deployments must not fail due to missing secrets svc.
+func (s *DeployService) fetchSecretEnvVars(serviceID, environment string) map[string]string {
+	url := fmt.Sprintf("%s/api/v1/secrets/env-vars?service_id=%s&env_id=%s",
+		s.secretsSvcURL, serviceID, environment)
+	resp, err := http.Get(url) //nolint:gosec — internal service URL from config
+	if err != nil {
+		log.Printf("[deploy] secrets service unreachable, deploying without env vars: %v", err)
+		return nil
+	}
+	defer resp.Body.Close()
+	var envMap map[string]string
+	if err := json.NewDecoder(resp.Body).Decode(&envMap); err != nil {
+		log.Printf("[deploy] failed to parse secrets response: %v", err)
+		return nil
+	}
+	return envMap
 }
 
 func (s *DeployService) TriggerDeploy(ctx context.Context, req DeployRequest) (*Deployment, error) {
@@ -304,23 +327,25 @@ func (s *DeployService) Rollback(ctx context.Context, deploymentID string) error
 }
 
 // runContainer stops any existing container for the service and starts a new one.
-func (s *DeployService) runContainer(ctx context.Context, imageTag, containerName string, port int) error {
+// envVars are injected as -e KEY=VALUE flags (sourced from the secrets service).
+func (s *DeployService) runContainer(ctx context.Context, imageTag, containerName string, port int, envVars map[string]string) error {
 	// Stop and remove existing container — ignore errors (may not exist)
 	exec.CommandContext(ctx, "docker", "stop", containerName).Run()
 	exec.CommandContext(ctx, "docker", "rm", containerName).Run()
 
 	portFlag := fmt.Sprintf("%d:%d", port, port)
-	cmd := exec.CommandContext(ctx, "docker", "run", "-d",
-		"--name", containerName,
-		"-p", portFlag,
-		"--restart", "unless-stopped",
-		imageTag,
-	)
+	args := []string{"run", "-d", "--name", containerName, "-p", portFlag, "--restart", "unless-stopped"}
+	for k, v := range envVars {
+		args = append(args, "-e", k+"="+v)
+	}
+	args = append(args, imageTag)
+
+	cmd := exec.CommandContext(ctx, "docker", args...)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("docker run: %w: %s", err, strings.TrimSpace(string(out)))
 	}
-	log.Printf("[deploy] container started: %s (image=%s port=%d)", containerName, imageTag, port)
+	log.Printf("[deploy] container started: %s (image=%s port=%d secrets=%d)", containerName, imageTag, port, len(envVars))
 	return nil
 }
 
@@ -349,7 +374,8 @@ func (s *DeployService) subscribeToEvents() {
 			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 			defer cancel()
 
-			if err := s.runContainer(ctx, imageTag, d.ServiceID, port); err != nil {
+			envVars := s.fetchSecretEnvVars(d.ServiceID, d.Environment)
+			if err := s.runContainer(ctx, imageTag, d.ServiceID, port, envVars); err != nil {
 				log.Printf("[deploy] container run failed for %s: %v", deployID, err)
 				s.repo.UpdateStatus(deployID, StatusFailed, "container run failed: "+err.Error())
 				s.bus.Publish("deploy.failed", map[string]string{
@@ -584,7 +610,7 @@ func main() {
 		bus = &EventBus{}
 	}
 
-	svc := NewDeployService(repo, svcRegistry, bus)
+	svc := NewDeployService(repo, svcRegistry, bus, cfg.SecretsSvcURL)
 	svc.subscribeToEvents()
 
 	h := &Handler{svc: svc, webhookSecret: cfg.WebhookSecret}

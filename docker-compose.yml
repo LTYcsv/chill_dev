@@ -94,11 +94,14 @@ services:
       PORT: "8082"
       NATS_URL: nats://nats:4222
       WEBHOOK_SECRET: ${WEBHOOK_SECRET:-}
+      SECRETS_SVC_URL: http://secrets:8086
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock  # for docker run
     depends_on:
       nats:
         condition: service_healthy
+      secrets:
+        condition: service_started
     restart: unless-stopped
 
   build:
@@ -161,13 +164,7 @@ services:
       - "8087:8087"
     environment:
       PORT: "8087"
-      NATS_URL: nats://nats:4222
-      REDIS_URL: redis://redis:6379
-    depends_on:
-      nats:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
+      GRAPH_CONFIG: /app/graph.json
     restart: unless-stopped
 
 volumes:

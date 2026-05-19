@@ -4,6 +4,7 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
+	"database/sql"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -15,17 +16,20 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	_ "github.com/lib/pq"
 )
 
 type Config struct {
 	Port          string
-	EncryptionKey string // 32-byte hex key for AES-256-GCM
+	EncryptionKey string
+	DatabaseURL   string
 }
 
 func loadConfig() Config {
 	return Config{
 		Port:          getEnv("PORT", "8086"),
-		EncryptionKey: getEnv("ENCRYPTION_KEY", "12345678901234567890123456789012"), // 32 chars
+		EncryptionKey: getEnv("ENCRYPTION_KEY", "12345678901234567890123456789012"),
+		DatabaseURL:   getEnv("DATABASE_URL", ""),
 	}
 }
 
@@ -43,7 +47,7 @@ type Secret struct {
 	ServiceID      string    `json:"service_id"`
 	EnvironmentID  string    `json:"environment_id"`
 	Key            string    `json:"key"`
-	ValueEncrypted string    `json:"-"` // never serialize value
+	ValueEncrypted string    `json:"-"` // never serialized
 	CreatedAt      time.Time `json:"created_at"`
 	UpdatedAt      time.Time `json:"updated_at"`
 }
@@ -103,27 +107,38 @@ func (e *Encryptor) Decrypt(encoded string) (string, error) {
 	return string(plaintext), nil
 }
 
-// ─── Repository ───────────────────────────────────────────────
+// ─── Store interface ──────────────────────────────────────────
 
-type SecretRepo struct {
+type SecretStore interface {
+	// Set creates or updates a secret; returns the stored secret.
+	Set(serviceID, envID, key, encryptedValue string) (*Secret, error)
+	// List returns all secrets for a service+env (ValueEncrypted is populated).
+	List(serviceID, envID string) ([]*Secret, error)
+	// GetByID returns the secret by ID (ValueEncrypted is populated), or nil if not found.
+	GetByID(id string) (*Secret, error)
+	// Delete removes a secret; returns true if it existed.
+	Delete(id string) (bool, error)
+}
+
+// ─── In-memory store ──────────────────────────────────────────
+
+type MemSecretStore struct {
 	mu   sync.RWMutex
-	data map[string]*Secret // id -> secret
+	data map[string]*Secret
 }
 
-func NewSecretRepo() *SecretRepo {
-	return &SecretRepo{data: make(map[string]*Secret)}
+func NewMemSecretStore() *MemSecretStore {
+	return &MemSecretStore{data: make(map[string]*Secret)}
 }
 
-func (r *SecretRepo) Set(serviceID, envID, key, encryptedValue string) *Secret {
+func (r *MemSecretStore) Set(serviceID, envID, key, encryptedValue string) (*Secret, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-
-	// Look for existing secret with same service+env+key
 	for _, s := range r.data {
 		if s.ServiceID == serviceID && s.EnvironmentID == envID && s.Key == key {
 			s.ValueEncrypted = encryptedValue
 			s.UpdatedAt = time.Now()
-			return s
+			return s, nil
 		}
 	}
 	s := &Secret{
@@ -136,10 +151,10 @@ func (r *SecretRepo) Set(serviceID, envID, key, encryptedValue string) *Secret {
 		UpdatedAt:      time.Now(),
 	}
 	r.data[s.ID] = s
-	return s
+	return s, nil
 }
 
-func (r *SecretRepo) List(serviceID, envID string) []*Secret {
+func (r *MemSecretStore) List(serviceID, envID string) ([]*Secret, error) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	var out []*Secret
@@ -148,22 +163,98 @@ func (r *SecretRepo) List(serviceID, envID string) []*Secret {
 			out = append(out, s)
 		}
 	}
-	return out
+	return out, nil
 }
 
-func (r *SecretRepo) GetByID(id string) (*Secret, bool) {
+func (r *MemSecretStore) GetByID(id string) (*Secret, error) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	s, ok := r.data[id]
-	return s, ok
+	if !ok {
+		return nil, nil
+	}
+	return s, nil
 }
 
-func (r *SecretRepo) Delete(id string) bool {
+func (r *MemSecretStore) Delete(id string) (bool, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	_, ok := r.data[id]
 	delete(r.data, id)
-	return ok
+	return ok, nil
+}
+
+// ─── PostgreSQL store ─────────────────────────────────────────
+
+type PGSecretStore struct {
+	db *sql.DB
+}
+
+func NewPGSecretStore(databaseURL string) (*PGSecretStore, error) {
+	db, err := sql.Open("postgres", databaseURL)
+	if err != nil {
+		return nil, err
+	}
+	db.SetMaxOpenConns(10)
+	db.SetMaxIdleConns(3)
+	if err := db.Ping(); err != nil {
+		return nil, fmt.Errorf("postgres ping: %w", err)
+	}
+	return &PGSecretStore{db: db}, nil
+}
+
+func (r *PGSecretStore) Set(serviceID, envID, key, encryptedValue string) (*Secret, error) {
+	const q = `
+		INSERT INTO secrets (service_id, environment_id, key, value_encrypted)
+		VALUES ($1, $2, $3, $4)
+		ON CONFLICT (service_id, environment_id, key)
+		DO UPDATE SET value_encrypted = EXCLUDED.value_encrypted, updated_at = NOW()
+		RETURNING id, created_at, updated_at`
+	s := &Secret{ServiceID: serviceID, EnvironmentID: envID, Key: key, ValueEncrypted: encryptedValue}
+	err := r.db.QueryRow(q, serviceID, envID, key, encryptedValue).
+		Scan(&s.ID, &s.CreatedAt, &s.UpdatedAt)
+	return s, err
+}
+
+func (r *PGSecretStore) List(serviceID, envID string) ([]*Secret, error) {
+	const q = `SELECT id, key, service_id, environment_id, value_encrypted, created_at, updated_at
+	           FROM secrets WHERE service_id = $1 AND environment_id = $2`
+	rows, err := r.db.Query(q, serviceID, envID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*Secret
+	for rows.Next() {
+		s := &Secret{}
+		if err := rows.Scan(&s.ID, &s.Key, &s.ServiceID, &s.EnvironmentID,
+			&s.ValueEncrypted, &s.CreatedAt, &s.UpdatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, s)
+	}
+	return out, rows.Err()
+}
+
+func (r *PGSecretStore) GetByID(id string) (*Secret, error) {
+	const q = `SELECT id, key, service_id, environment_id, value_encrypted, created_at, updated_at
+	           FROM secrets WHERE id = $1`
+	s := &Secret{}
+	err := r.db.QueryRow(q, id).Scan(&s.ID, &s.Key, &s.ServiceID, &s.EnvironmentID,
+		&s.ValueEncrypted, &s.CreatedAt, &s.UpdatedAt)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	return s, err
+}
+
+func (r *PGSecretStore) Delete(id string) (bool, error) {
+	res, err := r.db.Exec(`DELETE FROM secrets WHERE id = $1`, id)
+	if err != nil {
+		return false, err
+	}
+	n, _ := res.RowsAffected()
+	return n > 0, nil
 }
 
 // ─── HTTP ─────────────────────────────────────────────────────
@@ -175,8 +266,8 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 }
 
 type Handler struct {
-	repo *SecretRepo
-	enc  *Encryptor
+	store SecretStore
+	enc   *Encryptor
 }
 
 // PUT /api/v1/secrets — create or update a secret
@@ -195,20 +286,20 @@ func (h *Handler) Set(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 400, map[string]string{"error": "key and value are required"})
 		return
 	}
-
 	encrypted, err := h.enc.Encrypt(req.Value)
 	if err != nil {
 		writeJSON(w, 500, map[string]string{"error": "encryption failed"})
 		return
 	}
-
-	s := h.repo.Set(req.ServiceID, req.EnvironmentID, req.Key, encrypted)
+	s, err := h.store.Set(req.ServiceID, req.EnvironmentID, req.Key, encrypted)
+	if err != nil {
+		log.Printf("[secrets] store.Set error: %v", err)
+		writeJSON(w, 500, map[string]string{"error": "store failed"})
+		return
+	}
 	writeJSON(w, 200, map[string]interface{}{
-		"id":             s.ID,
-		"service_id":     s.ServiceID,
-		"environment_id": s.EnvironmentID,
-		"key":            s.Key,
-		"updated_at":     s.UpdatedAt,
+		"id": s.ID, "service_id": s.ServiceID, "environment_id": s.EnvironmentID,
+		"key": s.Key, "updated_at": s.UpdatedAt,
 	})
 }
 
@@ -216,9 +307,12 @@ func (h *Handler) Set(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) List(w http.ResponseWriter, r *http.Request) {
 	serviceID := r.URL.Query().Get("service_id")
 	envID := r.URL.Query().Get("env_id")
-	secrets := h.repo.List(serviceID, envID)
-
-	// Never return values in list
+	secrets, err := h.store.List(serviceID, envID)
+	if err != nil {
+		log.Printf("[secrets] store.List error: %v", err)
+		writeJSON(w, 500, map[string]string{"error": "store error"})
+		return
+	}
 	type safeSecret struct {
 		ID            string    `json:"id"`
 		Key           string    `json:"key"`
@@ -226,15 +320,10 @@ func (h *Handler) List(w http.ResponseWriter, r *http.Request) {
 		EnvironmentID string    `json:"environment_id"`
 		UpdatedAt     time.Time `json:"updated_at"`
 	}
-	var out []safeSecret
+	out := make([]safeSecret, 0, len(secrets))
 	for _, s := range secrets {
-		out = append(out, safeSecret{
-			ID:            s.ID,
-			Key:           s.Key,
-			ServiceID:     s.ServiceID,
-			EnvironmentID: s.EnvironmentID,
-			UpdatedAt:     s.UpdatedAt,
-		})
+		out = append(out, safeSecret{ID: s.ID, Key: s.Key,
+			ServiceID: s.ServiceID, EnvironmentID: s.EnvironmentID, UpdatedAt: s.UpdatedAt})
 	}
 	writeJSON(w, 200, out)
 }
@@ -242,8 +331,13 @@ func (h *Handler) List(w http.ResponseWriter, r *http.Request) {
 // GET /api/v1/secrets/{id}/value — decrypt and return value (internal only)
 func (h *Handler) GetValue(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	s, ok := h.repo.GetByID(id)
-	if !ok {
+	s, err := h.store.GetByID(id)
+	if err != nil {
+		log.Printf("[secrets] store.GetByID error: %v", err)
+		writeJSON(w, 500, map[string]string{"error": "store error"})
+		return
+	}
+	if s == nil {
 		writeJSON(w, 404, map[string]string{"error": "not found"})
 		return
 	}
@@ -255,16 +349,21 @@ func (h *Handler) GetValue(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]string{"key": s.Key, "value": value})
 }
 
-// GET /api/v1/secrets/env-vars?service_id=X&env_id=Y — return all as KEY=VALUE map
+// GET /api/v1/secrets/env-vars?service_id=X&env_id=Y — all secrets as KEY=VALUE map (internal only)
 func (h *Handler) EnvVars(w http.ResponseWriter, r *http.Request) {
 	serviceID := r.URL.Query().Get("service_id")
 	envID := r.URL.Query().Get("env_id")
-	secrets := h.repo.List(serviceID, envID)
-
-	envMap := make(map[string]string)
+	secrets, err := h.store.List(serviceID, envID)
+	if err != nil {
+		log.Printf("[secrets] store.List error: %v", err)
+		writeJSON(w, 500, map[string]string{"error": "store error"})
+		return
+	}
+	envMap := make(map[string]string, len(secrets))
 	for _, s := range secrets {
 		value, err := h.enc.Decrypt(s.ValueEncrypted)
 		if err != nil {
+			log.Printf("[secrets] decrypt error for key %s: %v", s.Key, err)
 			continue
 		}
 		envMap[s.Key] = value
@@ -272,9 +371,16 @@ func (h *Handler) EnvVars(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, envMap)
 }
 
+// DELETE /api/v1/secrets/{id}
 func (h *Handler) Delete(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	if !h.repo.Delete(id) {
+	ok, err := h.store.Delete(id)
+	if err != nil {
+		log.Printf("[secrets] store.Delete error: %v", err)
+		writeJSON(w, 500, map[string]string{"error": "store error"})
+		return
+	}
+	if !ok {
 		writeJSON(w, 404, map[string]string{"error": "not found"})
 		return
 	}
@@ -289,17 +395,33 @@ func main() {
 		log.Fatalf("invalid encryption key: %v", err)
 	}
 
-	repo := NewSecretRepo()
-	h := &Handler{repo: repo, enc: enc}
+	var store SecretStore
+	if cfg.DatabaseURL != "" {
+		pg, err := NewPGSecretStore(cfg.DatabaseURL)
+		if err != nil {
+			log.Fatalf("postgres connect: %v", err)
+		}
+		store = pg
+		log.Printf("[secrets-service] using PostgreSQL storage")
+	} else {
+		store = NewMemSecretStore()
+		log.Printf("[secrets-service] using in-memory storage (set DATABASE_URL for persistence)")
+	}
+
+	h := &Handler{store: store, enc: enc}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("PUT /api/v1/secrets", h.Set)
 	mux.HandleFunc("GET /api/v1/secrets", h.List)
-	mux.HandleFunc("GET /api/v1/secrets/{id}/value", h.GetValue)
 	mux.HandleFunc("GET /api/v1/secrets/env-vars", h.EnvVars)
+	mux.HandleFunc("GET /api/v1/secrets/{id}/value", h.GetValue)
 	mux.HandleFunc("DELETE /api/v1/secrets/{id}", h.Delete)
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, 200, map[string]string{"status": "ok", "service": "secrets"})
+		backend := "memory"
+		if cfg.DatabaseURL != "" {
+			backend = "postgres"
+		}
+		writeJSON(w, 200, map[string]string{"status": "ok", "service": "secrets", "backend": backend})
 	})
 
 	srv := &http.Server{

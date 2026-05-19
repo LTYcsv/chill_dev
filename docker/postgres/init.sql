@@ -80,12 +80,14 @@ CREATE INDEX IF NOT EXISTS idx_deployments_service ON deployments(service_id);
 CREATE INDEX IF NOT EXISTS idx_deployments_status  ON deployments(status);
 
 -- ─── Secrets ──────────────────────────────────────────────────
+-- service_id / environment_id are opaque strings (no FK) because
+-- the deploy service registry is in-memory for MVP.
 CREATE TABLE IF NOT EXISTS secrets (
     id              UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    service_id      UUID NOT NULL REFERENCES services(id) ON DELETE CASCADE,
-    environment_id  UUID REFERENCES environments(id),
+    service_id      TEXT NOT NULL,
+    environment_id  TEXT NOT NULL DEFAULT '',
     key             TEXT NOT NULL,
-    value_encrypted BYTEA NOT NULL,
+    value_encrypted TEXT NOT NULL,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     UNIQUE(service_id, environment_id, key)

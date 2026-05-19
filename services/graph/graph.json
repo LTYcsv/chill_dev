@@ -1,0 +1,20 @@
+{
+  "nodes": [
+    {"id": "api-gateway",   "name": "api-gateway",   "type": "service",  "project_id": "demo", "environment": "production", "status": "running"},
+    {"id": "auth-svc",      "name": "auth-service",  "type": "service",  "project_id": "demo", "environment": "production", "status": "running"},
+    {"id": "user-svc",      "name": "user-service",  "type": "service",  "project_id": "demo", "environment": "production", "status": "running"},
+    {"id": "order-svc",     "name": "order-service", "type": "service",  "project_id": "demo", "environment": "production", "status": "running"},
+    {"id": "postgres-main", "name": "postgres",       "type": "database", "project_id": "demo", "environment": "production", "status": "running"},
+    {"id": "redis-cache",   "name": "redis",          "type": "cache",    "project_id": "demo", "environment": "production", "status": "running"},
+    {"id": "nats-bus",      "name": "nats",           "type": "queue",    "project_id": "demo", "environment": "production", "status": "running"}
+  ],
+  "edges": [
+    {"id": "e1", "from": "api-gateway", "to": "auth-svc",      "protocol": "http",     "rps": 500, "p99_ms": 12},
+    {"id": "e2", "from": "api-gateway", "to": "user-svc",      "protocol": "http",     "rps": 300, "p99_ms": 25},
+    {"id": "e3", "from": "api-gateway", "to": "order-svc",     "protocol": "http",     "rps": 150, "p99_ms": 45},
+    {"id": "e4", "from": "user-svc",    "to": "postgres-main", "protocol": "postgres", "rps": 200, "p99_ms": 5},
+    {"id": "e5", "from": "order-svc",   "to": "postgres-main", "protocol": "postgres", "rps": 100, "p99_ms": 5},
+    {"id": "e6", "from": "auth-svc",    "to": "redis-cache",   "protocol": "tcp",      "rps": 800, "p99_ms": 1},
+    {"id": "e7", "from": "order-svc",   "to": "nats-bus",      "protocol": "nats",     "rps": 50,  "p99_ms": 2}
+  ]
+}
