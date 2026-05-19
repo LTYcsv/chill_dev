@@ -43,7 +43,7 @@ services:
   registry:
     image: registry:2
     ports:
-      - "5000:5000"
+      - "5001:5000"
     volumes:
       - registry_data:/var/lib/registry
 
@@ -95,10 +95,13 @@ services:
       NATS_URL: nats://nats:4222
       WEBHOOK_SECRET: ${WEBHOOK_SECRET:-}
       SECRETS_SVC_URL: http://secrets:8086
+      DATABASE_URL: postgres://devplatform:devplatform@postgres:5432/devplatform?sslmode=disable
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock  # for docker run
     depends_on:
       nats:
+        condition: service_healthy
+      postgres:
         condition: service_healthy
       secrets:
         condition: service_started

@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -14,19 +15,22 @@ import (
 	"time"
 
 	"github.com/nats-io/nats.go"
+	"github.com/redis/go-redis/v9"
 )
 
 // ─── Config ───────────────────────────────────────────────────
 
 type Config struct {
-	Port    string
-	NATSURL string
+	Port     string
+	NATSURL  string
+	RedisURL string
 }
 
 func loadConfig() Config {
 	return Config{
-		Port:    getEnv("PORT", "8085"),
-		NATSURL: getEnv("NATS_URL", "nats://localhost:4222"),
+		Port:     getEnv("PORT", "8085"),
+		NATSURL:  getEnv("NATS_URL", "nats://localhost:4222"),
+		RedisURL: getEnv("REDIS_URL", ""),
 	}
 }
 
@@ -112,13 +116,48 @@ func (d *DeploymentLog) unsubscribe(ch chan LogLine) {
 	delete(d.subs, ch)
 }
 
+const redisKeyPrefix = "logs:dep:"
+const redisDoneTTL = 24 * time.Hour
+
 type LogStore struct {
 	mu   sync.RWMutex
 	data map[string]*DeploymentLog
+	rdb  *redis.Client // nil → no persistence
 }
 
-func NewLogStore() *LogStore {
-	return &LogStore{data: make(map[string]*DeploymentLog)}
+func NewLogStore(rdb *redis.Client) *LogStore {
+	return &LogStore{data: make(map[string]*DeploymentLog), rdb: rdb}
+}
+
+// redisKey returns the Redis list key for a deployment's log lines.
+func redisKey(deploymentID string) string { return redisKeyPrefix + deploymentID }
+
+// redisDoneKey returns the key used to signal a terminal deployment.
+func redisDoneKey(deploymentID string) string { return redisKeyPrefix + deploymentID + ":done" }
+
+// loadFromRedis attempts to restore a DeploymentLog from Redis for the given
+// deployment ID. Returns an empty log if Redis is unavailable or has no data.
+func (s *LogStore) loadFromRedis(deploymentID string) *DeploymentLog {
+	dl := newDeploymentLog()
+	if s.rdb == nil {
+		return dl
+	}
+	ctx := context.Background()
+	raw, err := s.rdb.LRange(ctx, redisKey(deploymentID), 0, -1).Result()
+	if err != nil || len(raw) == 0 {
+		return dl
+	}
+	for _, r := range raw {
+		var l LogLine
+		if json.Unmarshal([]byte(r), &l) == nil {
+			dl.lines = append(dl.lines, l)
+		}
+	}
+	// Mark done if the terminal key exists.
+	if exists, _ := s.rdb.Exists(ctx, redisDoneKey(deploymentID)).Result(); exists > 0 {
+		dl.done = true
+	}
+	return dl
 }
 
 func (s *LogStore) getOrCreate(deploymentID string) *DeploymentLog {
@@ -127,7 +166,7 @@ func (s *LogStore) getOrCreate(deploymentID string) *DeploymentLog {
 	if dl, ok := s.data[deploymentID]; ok {
 		return dl
 	}
-	dl := newDeploymentLog()
+	dl := s.loadFromRedis(deploymentID)
 	s.data[deploymentID] = dl
 	return dl
 }
@@ -146,11 +185,20 @@ func (s *LogStore) count() int {
 
 func (s *LogStore) Ingest(l LogLine) {
 	s.getOrCreate(l.DeploymentID).append(l)
+	if s.rdb != nil {
+		data, err := json.Marshal(l)
+		if err == nil {
+			go s.rdb.RPush(context.Background(), redisKey(l.DeploymentID), data)
+		}
+	}
 }
 
 func (s *LogStore) MarkDone(deploymentID string) {
 	if dl := s.get(deploymentID); dl != nil {
 		dl.markDone()
+	}
+	if s.rdb != nil {
+		go s.rdb.Set(context.Background(), redisDoneKey(deploymentID), "1", redisDoneTTL)
 	}
 }
 
@@ -373,7 +421,24 @@ func parseLines(s string) []string {
 
 func main() {
 	cfg := loadConfig()
-	store := NewLogStore()
+
+	var rdb *redis.Client
+	if cfg.RedisURL != "" {
+		opt, err := redis.ParseURL(cfg.RedisURL)
+		if err != nil {
+			log.Printf("[logs] warn: invalid REDIS_URL: %v", err)
+		} else {
+			rdb = redis.NewClient(opt)
+			if err := rdb.Ping(context.Background()).Err(); err != nil {
+				log.Printf("[logs] warn: Redis unavailable (%v), running without persistence", err)
+				rdb = nil
+			} else {
+				log.Println("[logs] Redis connected, log persistence enabled")
+			}
+		}
+	}
+
+	store := NewLogStore(rdb)
 
 	var nc *nats.Conn
 	nc, err := nats.Connect(cfg.NATSURL,
@@ -397,10 +462,19 @@ func main() {
 		if nc == nil || !nc.IsConnected() {
 			natsStatus = "disconnected"
 		}
+		redisStatus := "disabled"
+		if rdb != nil {
+			if rdb.Ping(r.Context()).Err() == nil {
+				redisStatus = "connected"
+			} else {
+				redisStatus = "disconnected"
+			}
+		}
 		writeJSON(w, 200, map[string]any{
-			"status":             "ok",
-			"service":            "logs",
-			"nats":               natsStatus,
+			"status":              "ok",
+			"service":             "logs",
+			"nats":                natsStatus,
+			"redis":               redisStatus,
 			"tracked_deployments": store.count(),
 		})
 	})
