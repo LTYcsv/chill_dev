@@ -2,18 +2,16 @@ package main
 
 // devp — Developer Infrastructure Platform CLI
 // Usage: devp <command> [flags]
-//
-// devp deploy --service api --env production
-// devp logs --service api --tail 100
-// devp secrets set DATABASE_URL postgres://...
-// devp graph --project myapp
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"text/tabwriter"
 	"time"
@@ -93,6 +91,20 @@ func (c *Client) JSON(method, path string, body any, out any) error {
 	return nil
 }
 
+// stream opens a long-lived GET connection (no timeout) for SSE.
+func (c *Client) stream(path string) (*http.Response, error) {
+	req, err := http.NewRequest("GET", c.baseURL+path, nil)
+	if err != nil {
+		return nil, err
+	}
+	if c.token != "" {
+		req.Header.Set("Authorization", "Bearer "+c.token)
+	}
+	req.Header.Set("Accept", "text/event-stream")
+	// Use a client with no timeout for streaming.
+	return (&http.Client{}).Do(req)
+}
+
 // ─── Commands ─────────────────────────────────────────────────
 
 func cmdDeploy(client *Client, args []string) {
@@ -101,6 +113,7 @@ func cmdDeploy(client *Client, args []string) {
 	env := flagString(args, "--env", "production")
 	branch := flagString(args, "--branch", "main")
 	gitRepo := flagString(args, "--repo", "")
+	watch := flagBool(args, "--watch")
 
 	if serviceID == "" {
 		fatal("--service is required")
@@ -125,7 +138,47 @@ func cmdDeploy(client *Client, args []string) {
 	fmt.Printf("  Service:     %s\n", result["service_id"])
 	fmt.Printf("  Environment: %s\n", result["environment"])
 	fmt.Printf("  Status:      %s\n", result["status"])
-	fmt.Printf("\nTrack: devp status --deployment %s\n", result["id"])
+
+	if watch {
+		fmt.Println()
+		watchDeployment(client, result["id"].(string))
+	} else {
+		fmt.Printf("\nTrack: devp status --deployment %s\n", result["id"])
+	}
+}
+
+func watchDeployment(client *Client, deploymentID string) {
+	lastStatus := ""
+	lastLogCount := 0
+
+	for {
+		var result map[string]interface{}
+		if err := client.JSON("GET", "/api/v1/deployments/"+deploymentID, nil, &result); err != nil {
+			fmt.Fprintf(os.Stderr, "warn: %s\n", err.Error())
+			time.Sleep(2 * time.Second)
+			continue
+		}
+
+		status, _ := result["status"].(string)
+		if status != lastStatus {
+			icon := statusIcon(status)
+			fmt.Printf("%s %s\n", icon, status)
+			lastStatus = status
+		}
+
+		if logs, ok := result["logs"].([]interface{}); ok && len(logs) > lastLogCount {
+			for _, l := range logs[lastLogCount:] {
+				fmt.Printf("   %s\n", l)
+			}
+			lastLogCount = len(logs)
+		}
+
+		switch status {
+		case "success", "failed", "rolled_back":
+			return
+		}
+		time.Sleep(2 * time.Second)
+	}
 }
 
 func cmdStatus(client *Client, args []string) {
@@ -157,6 +210,144 @@ func cmdStatus(client *Client, args []string) {
 	}
 }
 
+func cmdLogs(client *Client, args []string) {
+	serviceID := flagString(args, "--service", "")
+	tail := flagString(args, "--tail", "100")
+	follow := flagBool(args, "--follow")
+
+	if serviceID == "" {
+		fatal("--service is required")
+	}
+
+	if follow {
+		path := fmt.Sprintf("/api/v1/logs?service_id=%s&tail=%s&follow=true", serviceID, tail)
+		resp, err := client.stream(path)
+		if err != nil {
+			fatal("failed to connect: " + err.Error())
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode >= 400 {
+			var errResp map[string]string
+			json.NewDecoder(resp.Body).Decode(&errResp)
+			fatal(fmt.Sprintf("API error %d: %s", resp.StatusCode, errResp["error"]))
+		}
+
+		sc := bufio.NewScanner(resp.Body)
+		for sc.Scan() {
+			line := sc.Text()
+			if strings.HasPrefix(line, "data: ") {
+				fmt.Println(strings.TrimPrefix(line, "data: "))
+			}
+		}
+		if err := sc.Err(); err != nil && err != io.EOF {
+			fatal("stream error: " + err.Error())
+		}
+		return
+	}
+
+	var result map[string]interface{}
+	path := fmt.Sprintf("/api/v1/logs?service_id=%s&tail=%s", serviceID, tail)
+	if err := client.JSON("GET", path, nil, &result); err != nil {
+		fatal(err.Error())
+	}
+
+	lines, _ := result["lines"].([]interface{})
+	for _, l := range lines {
+		fmt.Println(l)
+	}
+}
+
+func cmdServices(client *Client, args []string) {
+	if len(args) == 0 {
+		fatal("usage: devp services [register|list|get|delete]")
+	}
+	sub := args[0]
+	rest := args[1:]
+
+	switch sub {
+	case "register":
+		name := flagString(rest, "--name", "")
+		repo := flagString(rest, "--repo", "")
+		branch := flagString(rest, "--branch", "main")
+		portStr := flagString(rest, "--port", "8080")
+		env := flagString(rest, "--env", "production")
+		projectID := flagString(rest, "--project", "")
+
+		if name == "" || repo == "" {
+			fatal("--name and --repo are required")
+		}
+		port, err := strconv.Atoi(portStr)
+		if err != nil {
+			fatal("--port must be a number")
+		}
+
+		payload := map[string]interface{}{
+			"name":        name,
+			"git_repo":    repo,
+			"git_branch":  branch,
+			"port":        port,
+			"environment": env,
+			"project_id":  projectID,
+		}
+		var result map[string]interface{}
+		if err := client.JSON("POST", "/api/v1/services", payload, &result); err != nil {
+			fatal(err.Error())
+		}
+		fmt.Printf("✓ Service registered\n")
+		fmt.Printf("  ID:     %s\n", result["id"])
+		fmt.Printf("  Name:   %s\n", result["name"])
+		fmt.Printf("  Repo:   %s @ %s\n", result["git_repo"], result["git_branch"])
+		fmt.Printf("  Port:   %v\n", result["port"])
+		fmt.Printf("  Env:    %s\n", result["environment"])
+
+	case "list":
+		var result []map[string]interface{}
+		if err := client.JSON("GET", "/api/v1/services", nil, &result); err != nil {
+			fatal(err.Error())
+		}
+		w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+		fmt.Fprintf(w, "ID\tNAME\tREPO\tBRANCH\tENV\tPORT\n")
+		fmt.Fprintf(w, "──\t────\t────\t──────\t───\t────\n")
+		for _, s := range result {
+			fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%v\n",
+				s["id"], s["name"], s["git_repo"], s["git_branch"], s["environment"], s["port"])
+		}
+		w.Flush()
+
+	case "get":
+		id := flagString(rest, "--id", "")
+		if id == "" && len(rest) > 0 {
+			id = rest[0]
+		}
+		if id == "" {
+			fatal("--id is required")
+		}
+		var result map[string]interface{}
+		if err := client.JSON("GET", "/api/v1/services/"+id, nil, &result); err != nil {
+			fatal(err.Error())
+		}
+		data, _ := json.MarshalIndent(result, "", "  ")
+		fmt.Println(string(data))
+
+	case "delete":
+		id := flagString(rest, "--id", "")
+		if id == "" && len(rest) > 0 {
+			id = rest[0]
+		}
+		if id == "" {
+			fatal("--id is required")
+		}
+		if err := client.JSON("DELETE", "/api/v1/services/"+id, nil, nil); err != nil {
+			fatal(err.Error())
+		}
+		fmt.Printf("✓ Service %s deleted\n", id)
+
+	default:
+		fatal("unknown services subcommand: " + sub)
+	}
+}
+
 func cmdGraph(client *Client, args []string) {
 	projectID := flagString(args, "--project", "demo")
 	env := flagString(args, "--env", "production")
@@ -167,7 +358,7 @@ func cmdGraph(client *Client, args []string) {
 		if err := client.JSON("GET", "/api/v1/graph/blast-radius/"+blastNode, nil, &result); err != nil {
 			fatal(err.Error())
 		}
-		fmt.Printf("💥 Blast Radius for node: %s (%s)\n", result["node_name"], result["node_id"])
+		fmt.Printf("Blast Radius for node: %s (%s)\n", result["node_name"], result["node_id"])
 		fmt.Printf("   Severity: %s\n", strings.ToUpper(result["severity"].(string)))
 		if names, ok := result["affected_names"].([]interface{}); ok {
 			fmt.Printf("   Affected services (%d):\n", len(names))
@@ -278,6 +469,15 @@ func flagString(args []string, flag, defaultVal string) string {
 	return defaultVal
 }
 
+func flagBool(args []string, flag string) bool {
+	for _, a := range args {
+		if a == flag {
+			return true
+		}
+	}
+	return false
+}
+
 func fatal(msg string) {
 	fmt.Fprintln(os.Stderr, "Error: "+msg)
 	os.Exit(1)
@@ -330,6 +530,10 @@ func main() {
 		cmdDeploy(client, args)
 	case "status":
 		cmdStatus(client, args)
+	case "logs":
+		cmdLogs(client, args)
+	case "services":
+		cmdServices(client, args)
 	case "graph":
 		cmdGraph(client, args)
 	case "secrets":
@@ -359,18 +563,30 @@ Commands:
   login      Authenticate with the platform
   deploy     Trigger a deployment
   status     Check deployment status
+  logs       View or stream service logs
+  services   Manage service registry
   graph      View infrastructure graph
   secrets    Manage environment secrets
   health     Check platform health
 
 Examples:
   devp login --email you@company.com --password secret
-  devp deploy --service api --project myapp --env production --repo https://github.com/me/api
-  devp status --deployment abc123
+
+  devp services register --name api --repo https://github.com/me/api --branch main --port 8080
+  devp services list
+  devp services delete --id <id>
+
+  devp deploy --service <id> --env production [--watch]
+  devp status --deployment <id>
+
+  devp logs --service <id> --tail 50
+  devp logs --service <id> --follow
+
   devp graph --project myapp --env production
   devp graph --blast-radius postgres-main
-  devp secrets set DATABASE_URL postgres://... --service api --env-id prod-env-id
-  devp secrets list --service api --env-id prod-env-id
+
+  devp secrets set DATABASE_URL postgres://... --service <id> --env-id prod
+  devp secrets list --service <id> --env-id prod
 
 Environment variables:
   DEVP_API_URL   Platform API URL (default: http://localhost:8080)

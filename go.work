@@ -7,5 +7,6 @@ use (
 	./services/build
 	./services/deploy
 	./services/graph
+	./services/logs
 	./services/secrets
 )
