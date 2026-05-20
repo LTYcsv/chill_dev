@@ -4,11 +4,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
 	"os"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -78,6 +80,95 @@ func CORS() Middleware {
 			next.ServeHTTP(w, r)
 		})
 	}
+}
+
+// ─── Rate Limiting ────────────────────────────────────────────
+
+type rateLimiter struct {
+	mu      sync.Mutex
+	buckets map[string]*rlBucket
+	rate    int
+	window  time.Duration
+}
+
+type rlBucket struct {
+	count   int
+	resetAt time.Time
+}
+
+func newRateLimiter(rate int, window time.Duration) *rateLimiter {
+	rl := &rateLimiter{
+		buckets: make(map[string]*rlBucket),
+		rate:    rate,
+		window:  window,
+	}
+	go rl.periodicCleanup()
+	return rl
+}
+
+func (rl *rateLimiter) allow(key string) bool {
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+	now := time.Now()
+	b, ok := rl.buckets[key]
+	if !ok || now.After(b.resetAt) {
+		rl.buckets[key] = &rlBucket{count: 1, resetAt: now.Add(rl.window)}
+		return true
+	}
+	if b.count >= rl.rate {
+		return false
+	}
+	b.count++
+	return true
+}
+
+func (rl *rateLimiter) periodicCleanup() {
+	t := time.NewTicker(5 * time.Minute)
+	defer t.Stop()
+	for range t.C {
+		rl.mu.Lock()
+		now := time.Now()
+		for k, b := range rl.buckets {
+			if now.After(b.resetAt) {
+				delete(rl.buckets, k)
+			}
+		}
+		rl.mu.Unlock()
+	}
+}
+
+func (rl *rateLimiter) Middleware() Middleware {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if !rl.allow(clientIP(r)) {
+				w.Header().Set("Retry-After", "60")
+				writeJSON(w, 429, map[string]string{"error": "rate limit exceeded"})
+				return
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
+func (rl *rateLimiter) wrap(next http.Handler) http.Handler {
+	return rl.Middleware()(next)
+}
+
+func clientIP(r *http.Request) string {
+	if ip := r.Header.Get("X-Real-IP"); ip != "" {
+		return ip
+	}
+	if fwd := r.Header.Get("X-Forwarded-For"); fwd != "" {
+		if i := strings.IndexByte(fwd, ','); i >= 0 {
+			return strings.TrimSpace(fwd[:i])
+		}
+		return strings.TrimSpace(fwd)
+	}
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return host
 }
 
 // AuthMiddleware validates JWT by calling auth-service /validate
@@ -174,8 +265,15 @@ func stripAndProxy(prefix, upstream string) http.Handler {
 func buildRouter(cfg Config) http.Handler {
 	mux := http.NewServeMux()
 
-	// Auth service (public + protected)
-	mux.Handle("/api/v1/auth/", newProxy(cfg.AuthSvcURL))
+	// Login and register get a strict per-IP limiter (10 req/min) to block brute-force.
+	// More specific patterns take precedence over the catch-all /api/v1/auth/ below.
+	authProxy := newProxy(cfg.AuthSvcURL)
+	loginLimiter := newRateLimiter(10, time.Minute)
+	mux.Handle("POST /api/v1/auth/login", loginLimiter.wrap(authProxy))
+	mux.Handle("POST /api/v1/auth/register", loginLimiter.wrap(authProxy))
+
+	// Auth service (public + protected) — everything else
+	mux.Handle("/api/v1/auth/", authProxy)
 
 	// Protected routes → downstream microservices
 	mux.Handle("/api/v1/deployments", newProxy(cfg.DeploySvcURL))
@@ -224,9 +322,11 @@ func buildRouter(cfg Config) http.Handler {
 	})
 
 	// Wrap everything with middleware
+	globalLimiter := newRateLimiter(200, time.Minute)
 	return chain(mux,
 		Logger(),
 		CORS(),
+		globalLimiter.Middleware(),
 		AuthMiddleware(cfg.AuthSvcURL),
 	)
 }
