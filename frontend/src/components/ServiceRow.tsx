@@ -28,9 +28,10 @@ interface Props {
   lastDeployStatus?: DeploymentStatus
   lastCommit?: string
   onDeploy?: (id: string) => void
+  onDelete?: (id: string) => void
 }
 
-export function ServiceRow({ svc, health, lastDeployStatus, lastCommit, onDeploy }: Props) {
+export function ServiceRow({ svc, health, lastDeployStatus, lastCommit, onDeploy, onDelete }: Props) {
   const [deploying, setDeploying] = useState(false)
   const status = svcStatus(svc.name, health)
   const blast = computeBlast(svc.name)
@@ -89,6 +90,17 @@ export function ServiceRow({ svc, health, lastDeployStatus, lastCommit, onDeploy
       >
         {deploying ? '···' : isFailed ? 'Retry' : 'Deploy'}
       </button>
+
+      {onDelete && (
+        <button
+          className="svc-deploy-btn"
+          style={{ color: 'var(--red)', borderColor: 'rgba(240,82,82,0.25)' }}
+          onClick={() => onDelete(svc.id)}
+          title="Delete service"
+        >
+          ✕
+        </button>
+      )}
     </div>
   )
 }

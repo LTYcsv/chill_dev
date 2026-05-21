@@ -264,7 +264,7 @@ func (r *DeploymentRepo) ListByService(serviceID string) []*Deployment {
 	defer r.mu.RUnlock()
 	var out []*Deployment
 	for _, d := range r.data {
-		if d.ServiceID == serviceID {
+		if serviceID == "" || d.ServiceID == serviceID {
 			out = append(out, d)
 		}
 	}

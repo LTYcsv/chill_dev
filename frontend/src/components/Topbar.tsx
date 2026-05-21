@@ -2,6 +2,7 @@ import { useState } from 'react'
 
 interface Props {
   project?: string
+  page?: string
   env?: string
   onEnvChange?: (env: string) => void
   onTimeTravelClick?: () => void
@@ -10,13 +11,13 @@ interface Props {
 
 const ENVS = ['production', 'staging', 'development']
 
-export function Topbar({ project = 'my-project', env = 'production', onEnvChange, onTimeTravelClick, onDeployClick }: Props) {
+export function Topbar({ project = 'my-project', page = 'dashboard', env = 'production', onEnvChange, onTimeTravelClick, onDeployClick }: Props) {
   const [envOpen, setEnvOpen] = useState(false)
 
   return (
     <div className="topbar">
       <div className="topbar-title">
-        {project} <span>/ dashboard</span>
+        {project} <span>/ {page}</span>
       </div>
 
       <div style={{ position: 'relative' }}>

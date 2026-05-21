@@ -90,3 +90,25 @@ export interface LogLine {
 export interface LoginResponse {
   token: string
 }
+
+export interface AuthUser {
+  user_id: string
+  email: string
+  team_id: string
+  role: string
+}
+
+export interface Secret {
+  id: string
+  service_id: string
+  environment_id: string
+  key: string
+  created_at: string
+  updated_at: string
+}
+
+export interface GraphSnapshot {
+  snapshot: string
+  node_count: number
+  edge_count: number
+}
