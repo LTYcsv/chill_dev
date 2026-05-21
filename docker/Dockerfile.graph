@@ -1,10 +1,15 @@
 FROM golang:1.22-alpine AS builder
 RUN apk add --no-cache git ca-certificates
 WORKDIR /app/services/graph
+
 COPY services/graph/go.mod ./
-RUN GOWORK=off go mod download
+RUN --mount=type=cache,target=/go/pkg/mod \
+    GOWORK=off go mod download
+
 COPY services/graph/ ./
-RUN GOWORK=off CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /service .
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    GOWORK=off CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /service .
 
 FROM alpine:latest
 RUN apk add --no-cache ca-certificates

@@ -221,6 +221,7 @@ func isPublicRoute(path string) bool {
 	}
 	// Prefix-match for routes that have sub-paths
 	for _, p := range []string{
+		"/assets/",
 		"/api/v1/auth/login",
 		"/api/v1/auth/register",
 		"/api/v1/webhooks/github", // GitHub calls this directly, no JWT
