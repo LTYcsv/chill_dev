@@ -1,4 +1,4 @@
-.PHONY: help dev stop logs ps build test lint migrate ngrok webhook-url webhook-test pipeline-test
+.PHONY: help dev stop logs ps build test lint migrate ngrok webhook-url webhook-test pipeline-test frontend-dev frontend-build
 
 SERVICES := auth deploy build logs secrets graph
 GATEWAY  := gateway
@@ -19,10 +19,9 @@ run-all: ## Run all services locally (not in Docker)
 	@export REGISTRY_HOST=localhost:5001 && \
 	for svc in $(SERVICES); do \
 		echo "Starting $$svc..."; \
-		cd services/$$svc && go run . & \
-		cd ../..; \
+		(cd services/$$svc && go run .) & \
 	done
-	cd gateway && go run . &
+	(cd gateway && go run .) &
 	@echo "All services started. Gateway → http://localhost:8080"
 
 stop: ## Stop all background services
@@ -46,9 +45,9 @@ ps: ## Show service status
 build: ## Build all Go binaries
 	@for svc in $(SERVICES); do \
 		echo "Building $$svc..."; \
-		cd services/$$svc && go build -o ../../bin/$$svc . && cd ../..; \
+		(cd services/$$svc && go build -o ../../bin/$$svc .); \
 	done
-	cd gateway && go build -o ../bin/gateway . && cd ..
+	(cd gateway && go build -o ../bin/gateway .)
 
 build-images: ## Build Docker images for all services
 	@for svc in $(SERVICES); do \
@@ -61,7 +60,7 @@ test: ## Run all tests
 	go work sync
 	@for svc in $(SERVICES); do \
 		echo "Testing $$svc..."; \
-		cd services/$$svc && go test ./... -v && cd ../..; \
+		(cd services/$$svc && go test ./... -v); \
 	done
 
 test-integration: ## Run integration tests (requires running stack)
@@ -82,6 +81,12 @@ db-shell: ## Open psql shell
 	docker compose exec postgres psql -U devplatform -d devplatform
 
 # ─── CLI ──────────────────────────────────────────────────────
+frontend-dev: ## Start Vite dev server (proxies /api → :8080)
+	cd frontend && npm run dev
+
+frontend-build: ## Build frontend → gateway/static/
+	cd frontend && npm run build
+
 cli-build: ## Build the CLI binary
 	cd cli && go build -o ../bin/devp . && cd ..
 	@echo "CLI built: ./bin/devp"

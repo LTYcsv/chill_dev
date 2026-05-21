@@ -1,8 +1,10 @@
 package main
 
 import (
+	"embed"
 	"encoding/json"
 	"fmt"
+	"io/fs"
 	"log"
 	"net"
 	"net/http"
@@ -13,6 +15,9 @@ import (
 	"sync"
 	"time"
 )
+
+//go:embed static
+var staticFiles embed.FS
 
 // ─── Config ───────────────────────────────────────────────────
 
@@ -209,13 +214,17 @@ func AuthMiddleware(authSvcURL string) Middleware {
 }
 
 func isPublicRoute(path string) bool {
-	public := []string{
-		"/healthz",
+	// Exact-match only (no prefix logic — avoids "/" matching everything)
+	switch path {
+	case "/healthz", "/", "/index.html":
+		return true
+	}
+	// Prefix-match for routes that have sub-paths
+	for _, p := range []string{
 		"/api/v1/auth/login",
 		"/api/v1/auth/register",
 		"/api/v1/webhooks/github", // GitHub calls this directly, no JWT
-	}
-	for _, p := range public {
+	} {
 		if path == p || strings.HasPrefix(path, p) {
 			return true
 		}
@@ -293,6 +302,10 @@ func buildRouter(cfg Config) http.Handler {
 
 	mux.Handle("/api/v1/logs", newProxy(cfg.LogsSvcURL))
 	mux.Handle("/api/v1/logs/", newProxy(cfg.LogsSvcURL))
+
+	// Dashboard UI
+	sub, _ := fs.Sub(staticFiles, "static")
+	mux.Handle("/", http.FileServer(http.FS(sub)))
 
 	// Gateway health (aggregates upstream health)
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
